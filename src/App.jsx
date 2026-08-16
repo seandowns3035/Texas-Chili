@@ -333,6 +333,8 @@ function startRound(room, roundNumber) {
   room.kitty = kitty;
   room.kittyAwarded = false;
   room.kittyReveal = null;
+  room.awaitingTrickClear = false;
+  room.trickWinnerId = null;
   room.currentTrick = [];
   room.leadSuit = null;
   room.forcedOpenCard = opener.card;
@@ -356,6 +358,7 @@ function startRound(room, roundNumber) {
 
 function playCard(room, playerId, card) {
   if (room.status !== "playing") return room;
+  if (room.awaitingTrickClear) return room; // paused showing the trick winner — no plays yet
   if (room.currentTurnId !== playerId) return room;
   const hand = room.hands[playerId] || [];
   const idx = hand.findIndex((c) => c.rank === card.rank && c.suit === card.suit);
@@ -380,7 +383,9 @@ function playCard(room, playerId, card) {
     return room;
   }
 
-  // Trick complete — resolve winner
+  // Trick complete — mark the winner but leave all 4 cards on the table.
+  // The actual capture/clear/advance happens in resolveTrickAfterPause,
+  // triggered client-side after a short delay so everyone can see who won.
   const leadSuit = room.leadSuit;
   let winning = room.currentTrick[0];
   for (const play of room.currentTrick) {
@@ -388,7 +393,22 @@ function playCard(room, playerId, card) {
       winning = play;
     }
   }
-  const winnerId = winning.playerId;
+  room.trickWinnerId = winning.playerId;
+  room.awaitingTrickClear = true;
+  const winnerName = room.players.find((p) => p.id === winning.playerId)?.name || winning.playerId;
+  pushLog(room, `${winnerName} won the trick.`);
+
+  return room;
+}
+
+/* Runs after the trick-winner pause: captures the cards, awards the kitty
+   if this was the first trick, advances the turn, and checks for a round
+   end. Safe to call from multiple clients — it's a no-op once awaitingTrickClear
+   has already been cleared, and every client computes the same result from
+   the same frozen state, so a harmless duplicate write is the worst case. */
+function resolveTrickAfterPause(room) {
+  if (!room.awaitingTrickClear) return room;
+  const winnerId = room.trickWinnerId;
   const wonCards = room.currentTrick.map((p) => p.card);
   room.capturedCards[winnerId] = (room.capturedCards[winnerId] || []).concat(wonCards);
   room.tricksWon[winnerId] = (room.tricksWon[winnerId] || 0) + 1;
@@ -401,14 +421,13 @@ function playCard(room, playerId, card) {
     room.kittyReveal = { id: room.kittyRevealSeq, winnerId, cards: room.kitty };
   }
 
-  const winnerName = room.players.find((p) => p.id === winnerId)?.name || winnerId;
-  pushLog(room, `${winnerName} won the trick.`);
-
   room.currentTrick = [];
   room.leadSuit = null;
   room.leaderId = winnerId;
   room.currentTurnId = winnerId;
   room.trickNumber += 1;
+  room.awaitingTrickClear = false;
+  room.trickWinnerId = null;
 
   const handsEmpty = room.turnOrder.every((pid) => (room.hands[pid] || []).length === 0);
   const earlyEnd = checkEarlyRoundEnd(room);
@@ -451,7 +470,7 @@ function checkEarlyRoundEnd(room) {
 }
 
 /* ============================== SMALL UI PIECES ============================== */
-function PlayingCard({ card, size = "md", faceDown, dim, onClick, selected }) {
+function PlayingCard({ card, size = "md", faceDown, dim, onClick, selected, won }) {
   const dims = {
     sm: { w: 40, h: 56, font: 13, corner: 10 },
     md: { w: 58, h: 82, font: 20, corner: 13 },
@@ -483,8 +502,10 @@ function PlayingCard({ card, size = "md", faceDown, dim, onClick, selected }) {
         height: dims.h,
         borderRadius: 8,
         background: T.cream,
-        border: selected ? `2px solid ${T.brassLight}` : "1.5px solid #cfc6ac",
-        boxShadow: selected
+        border: selected || won ? `2px solid ${T.brassLight}` : "1.5px solid #cfc6ac",
+        boxShadow: won
+          ? `0 0 0 3px ${T.brassLight}88, 0 0 16px 3px ${T.brassLight}99, 0 4px 8px rgba(0,0,0,0.45)`
+          : selected
           ? `0 0 0 2px ${T.brassLight}55, 0 4px 8px rgba(0,0,0,0.45)`
           : "0 2px 5px rgba(0,0,0,0.35)",
         position: "relative",
@@ -690,7 +711,7 @@ function Ledger({ room, myId, onClose }) {
         position: "fixed",
         inset: 0,
         background: "rgba(0,0,0,0.6)",
-        zIndex: 50,
+        zIndex: 65,
         display: "flex",
         alignItems: "flex-end",
       }}
@@ -818,6 +839,7 @@ export default function App() {
   const audioCtxRef = useRef(null);
   const prevTurnIdRef = useRef(null);
   const [shareCopied, setShareCopied] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
   const [chimeEnabled, setChimeEnabled] = useState(() => loadBoolPref(CHIME_PREF_KEY, true));
   const [flashEnabled, setFlashEnabled] = useState(() => loadBoolPref(FLASH_PREF_KEY, true));
 
@@ -867,6 +889,31 @@ export default function App() {
       g.connect(ctx.destination);
       o.start();
       o.stop(ctx.currentTime + 0.42);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  // A brighter two-note rising chime, distinct from the single-tone turn
+  // alert, so the kitty reveal has its own recognizable sound.
+  function playKittyChime() {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const now = ctx.currentTime;
+      [660, 990].forEach((freq, i) => {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.value = freq;
+        const start = now + i * 0.11;
+        g.gain.setValueAtTime(0.0001, start);
+        g.gain.exponentialRampToValueAtTime(0.17, start + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, start + 0.3);
+        o.connect(g);
+        g.connect(ctx.destination);
+        o.start(start);
+        o.stop(start + 0.32);
+      });
     } catch (e) {
       /* ignore */
     }
@@ -936,10 +983,27 @@ export default function App() {
     if (reveal.id !== seenKittyId.current) {
       seenKittyId.current = reveal.id;
       setKittyFlash(reveal);
+      if (chimeEnabled) playKittyChime();
       const t = setTimeout(() => setKittyFlash(null), 3200);
       return () => clearTimeout(t);
     }
-  }, [room?.kittyReveal?.id]);
+  }, [room?.kittyReveal?.id, chimeEnabled]);
+
+  // Trick-winner pause: once a trick is marked complete (awaitingTrickClear),
+  // wait briefly so everyone can see the winning card highlighted, then
+  // advance the game. Any client can perform this — the computation is
+  // deterministic from the frozen room state, so a duplicate write from
+  // two clients racing is harmless (same result, last write wins).
+  useEffect(() => {
+    if (!room || !room.awaitingTrickClear || !code) return;
+    const t = setTimeout(async () => {
+      let r = JSON.parse(JSON.stringify(room));
+      r = resolveTrickAfterPause(r);
+      await saveRoom(code, r);
+      setRoom(r);
+    }, 1400);
+    return () => clearTimeout(t);
+  }, [room?.awaitingTrickClear, code]);
 
   // Turn alert: a brief flash + chime the moment a new turn actually starts
   // (not every render while it's still the same person's turn). Fires when
@@ -1134,6 +1198,17 @@ export default function App() {
     }
   }
 
+  async function copyRoomCode() {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 1500);
+    } catch (e) {
+      /* clipboard unavailable — nothing more we can do here */
+    }
+  }
+
   if (autoRejoining) {
     return (
       <div style={outerWrap}>
@@ -1146,7 +1221,7 @@ export default function App() {
   if (screen === "entry") {
     return (
       <div style={outerWrap}>
-        <div style={{ width: "100%", maxWidth: 380 }}>
+        <div style={{ width: "100%", maxWidth: "min(460px, 92vw)" }}>
           <div style={{ textAlign: "center", marginBottom: 28 }}>
             <div style={{ fontFamily: DISPLAY_FONT, fontSize: 15, letterSpacing: 3, color: T.brassLight, textTransform: "uppercase" }}>
               A Trick-Taking Table
@@ -1251,14 +1326,26 @@ export default function App() {
   if (screen === "lobby" || room.status === "lobby") {
     return (
       <div style={outerWrap}>
-        <div style={{ width: "100%", maxWidth: 380 }}>
+        <div style={{ width: "100%", maxWidth: "min(460px, 92vw)" }}>
           <div style={{ textAlign: "center", marginBottom: 20 }}>
             <div style={{ fontSize: 12, color: T.cream, opacity: 0.6, letterSpacing: 2 }}>ROOM CODE</div>
-            <div style={{ fontFamily: DISPLAY_FONT, fontSize: 44, fontWeight: 700, color: T.brassLight, letterSpacing: 6 }}>
+            <button
+              onClick={copyRoomCode}
+              style={{
+                background: "transparent",
+                border: "none",
+                fontFamily: DISPLAY_FONT,
+                fontSize: 44,
+                fontWeight: 700,
+                color: T.brassLight,
+                letterSpacing: 6,
+                padding: 0,
+              }}
+            >
               {code}
-            </div>
+            </button>
             <div style={{ fontSize: 12, color: T.cream, opacity: 0.55, marginTop: 4 }}>
-              Share this code with the other players
+              {codeCopied ? "Copied!" : "Tap the code to copy, or share the link"}
             </div>
             <button
               onClick={shareInvite}
@@ -1349,7 +1436,7 @@ export default function App() {
   const opponents = room.turnOrder.filter((pid) => pid !== myId);
   const activeSeat = room.practiceMode ? room.currentTurnId : myId;
   const myHand = room.hands?.[activeSeat] || [];
-  const isMyTurn = room.practiceMode ? true : room.currentTurnId === myId;
+  const isMyTurn = !room.awaitingTrickClear && (room.practiceMode ? true : room.currentTurnId === myId);
   const isForcedOpen = room.trickNumber === 1 && room.currentTrick.length === 0;
   const forcedCardForHand = isForcedOpen ? room.forcedOpenCard : null;
   const nameOf = (pid) => room.players.find((p) => p.id === pid)?.name || pid;
@@ -1496,7 +1583,7 @@ export default function App() {
         <div
           style={{
             width: "100%",
-            maxWidth: 340,
+            maxWidth: "min(520px, 88vw)",
             minHeight: 150,
             borderRadius: 20,
             border: `2px solid ${T.feltLine}`,
@@ -1516,26 +1603,31 @@ export default function App() {
                 : `${nameOf(room.currentTurnId)} is leading the trick`}
             </div>
           ) : (
-            room.currentTrick.map((play) => (
-              <div key={play.playerId} style={{ textAlign: "center" }}>
-                <PlayingCard card={play.card} size="md" />
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: T.cream,
-                    opacity: 0.6,
-                    marginTop: 4,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    gap: 4,
-                  }}
-                >
-                  <ColorDot color={seatColor(room, play.playerId)} size={6} />
-                  {nameOf(play.playerId)}
+            room.currentTrick.map((play) => {
+              const isWinner = room.awaitingTrickClear && play.playerId === room.trickWinnerId;
+              return (
+                <div key={play.playerId} style={{ textAlign: "center" }}>
+                  <PlayingCard card={play.card} size="md" won={isWinner} />
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: isWinner ? T.brassLight : T.cream,
+                      opacity: isWinner ? 1 : 0.6,
+                      fontWeight: isWinner ? 700 : 400,
+                      marginTop: 4,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      gap: 4,
+                    }}
+                  >
+                    <ColorDot color={seatColor(room, play.playerId)} size={6} />
+                    {nameOf(play.playerId)}
+                    {isWinner ? " won!" : ""}
+                  </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
         </div>
         {room.leadSuit && (
@@ -1572,7 +1664,13 @@ export default function App() {
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 8px" }}>
           <div style={{ fontFamily: DISPLAY_FONT, fontSize: 13, color: isMyTurn ? T.brassLight : T.cream, fontWeight: 700 }}>
-            {room.practiceMode ? `Playing as ${nameOf(activeSeat)}` : isMyTurn ? "Your turn" : `Waiting on ${nameOf(room.currentTurnId)}`}
+            {room.awaitingTrickClear
+              ? "Trick complete…"
+              : room.practiceMode
+              ? `Playing as ${nameOf(activeSeat)}`
+              : isMyTurn
+              ? "Your turn"
+              : `Waiting on ${nameOf(room.currentTurnId)}`}
           </div>
           {selectedCard && (
             <button
@@ -1626,6 +1724,8 @@ export default function App() {
       {showMenu && (
         <GameMenu
           code={code}
+          codeCopied={codeCopied}
+          onCopyCode={copyRoomCode}
           chimeEnabled={chimeEnabled}
           flashEnabled={flashEnabled}
           onToggleChime={toggleChime}
@@ -1652,12 +1752,14 @@ export default function App() {
       {room.status === "round-end" && (
         <RoundEndOverlay room={room} nameOf={nameOf} onContinue={continueToNextRound} />
       )}
-      {room.status === "game-end" && <GameEndOverlay room={room} nameOf={nameOf} onLeave={leaveToMenu} />}
+      {room.status === "game-end" && (
+        <GameEndOverlay room={room} nameOf={nameOf} onLeave={leaveToMenu} onOpenLedger={() => setShowLedger(true)} />
+      )}
     </div>
   );
 }
 
-function GameMenu({ code, chimeEnabled, flashEnabled, onToggleChime, onToggleFlash, onLeave, onRequestEndTable, onClose }) {
+function GameMenu({ code, codeCopied, onCopyCode, chimeEnabled, flashEnabled, onToggleChime, onToggleFlash, onLeave, onRequestEndTable, onClose }) {
   return (
     <div
       style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }}
@@ -1674,10 +1776,23 @@ function GameMenu({ code, chimeEnabled, flashEnabled, onToggleChime, onToggleFla
         }}
       >
         <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.ink, marginBottom: 4 }}>Menu</div>
-        <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, letterSpacing: 1, marginBottom: 2 }}>ROOM CODE</div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 28, fontWeight: 700, color: T.brassDim, letterSpacing: 4, marginBottom: 12 }}>
-          {code}
-        </div>
+        <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, letterSpacing: 1, marginBottom: 2 }}>ROOM CODE — TAP TO COPY</div>
+        <button
+          onClick={onCopyCode}
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            fontFamily: DISPLAY_FONT,
+            fontSize: 28,
+            fontWeight: 700,
+            color: T.brassDim,
+            letterSpacing: 4,
+            marginBottom: 12,
+          }}
+        >
+          {codeCopied ? "Copied!" : code}
+        </button>
 
         <div style={{ borderTop: "1px solid #e3dbc4", borderBottom: "1px solid #e3dbc4", marginBottom: 16 }}>
           <Toggle checked={chimeEnabled} onChange={onToggleChime} label="Turn Chime" />
@@ -1761,7 +1876,47 @@ function RoundEndOverlay({ room, nameOf, onContinue }) {
   );
 }
 
-function GameEndOverlay({ room, nameOf, onLeave }) {
+function Confetti() {
+  const [pieces] = useState(() =>
+    Array.from({ length: 36 }).map((_, i) => ({
+      id: i,
+      left: Math.random() * 100,
+      delay: Math.random() * 0.5,
+      duration: 2.2 + Math.random() * 1.3,
+      color: SEAT_COLORS[i % SEAT_COLORS.length],
+      rotate: Math.random() * 360,
+      w: 6 + Math.random() * 6,
+    }))
+  );
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 70, pointerEvents: "none", overflow: "hidden" }}>
+      {pieces.map((p) => (
+        <div
+          key={p.id}
+          style={{
+            position: "absolute",
+            top: "-6%",
+            left: `${p.left}%`,
+            width: p.w,
+            height: p.w * 0.6,
+            background: p.color,
+            borderRadius: 2,
+            transform: `rotate(${p.rotate}deg)`,
+            animation: `confettiFall ${p.duration}s ease-in ${p.delay}s forwards`,
+          }}
+        />
+      ))}
+      <style>{`
+        @keyframes confettiFall {
+          0% { transform: translateY(0) rotate(0deg); opacity: 1; }
+          100% { transform: translateY(115vh) rotate(540deg); opacity: 0.9; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function GameEndOverlay({ room, nameOf, onLeave, onOpenLedger }) {
   const totals = room.turnOrder.map((pid) => ({
     pid,
     total: [1, 2, 3, 4, 5, 6].reduce((s, r) => s + ((room.scores[pid] || {})[r] || 0), 0),
@@ -1769,33 +1924,41 @@ function GameEndOverlay({ room, nameOf, onLeave }) {
   totals.sort((a, b) => a.total - b.total);
   const winner = totals[0];
   return (
-    <div style={overlayWrap}>
-      <div style={overlayCard}>
-        <div style={{ fontSize: 11, color: T.brassLight, letterSpacing: 2 }}>GAME COMPLETE</div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 24, color: T.brassLight, fontWeight: 700, marginBottom: 14 }}>
-          {nameOf(winner.pid)} wins!
-        </div>
-        {totals.map((e, i) => (
-          <div key={e.pid} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #234838" }}>
-            <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontWeight: i === 0 ? 700 : 400, display: "flex", alignItems: "center", gap: 6 }}>
-              <ColorDot color={seatColor(room, e.pid)} />
-              {i + 1}. {nameOf(e.pid)}
-            </span>
-            <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontVariantNumeric: "tabular-nums" }}>
-              {e.total}
-            </span>
+    <>
+      <Confetti />
+      <div style={overlayWrap}>
+        <div style={overlayCard}>
+          <div style={{ fontSize: 11, color: T.brassLight, letterSpacing: 2 }}>GAME COMPLETE</div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontSize: 24, color: T.brassLight, fontWeight: 700, marginBottom: 14 }}>
+            {nameOf(winner.pid)} wins!
           </div>
-        ))}
-        <div style={{ fontSize: 11, color: T.cream, opacity: 0.5, marginTop: 14, textAlign: "center" }}>
-          Lowest total wins. Start a new table to play again.
+          {totals.map((e, i) => (
+            <div key={e.pid} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #234838" }}>
+              <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontWeight: i === 0 ? 700 : 400, display: "flex", alignItems: "center", gap: 6 }}>
+                <ColorDot color={seatColor(room, e.pid)} />
+                {i + 1}. {nameOf(e.pid)}
+              </span>
+              <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontVariantNumeric: "tabular-nums" }}>
+                {e.total}
+              </span>
+            </div>
+          ))}
+          <div style={{ fontSize: 11, color: T.cream, opacity: 0.5, marginTop: 14, textAlign: "center" }}>
+            Lowest total wins. Start a new table to play again.
+          </div>
+          {onOpenLedger && (
+            <button onClick={onOpenLedger} style={{ ...buttonSecondary, width: "100%", marginTop: 16 }}>
+              View Full Ledger
+            </button>
+          )}
+          {onLeave && (
+            <button onClick={onLeave} style={{ ...buttonPrimary, width: "100%", marginTop: 10 }}>
+              Return to Main Menu
+            </button>
+          )}
         </div>
-        {onLeave && (
-          <button onClick={onLeave} style={{ ...buttonPrimary, width: "100%", marginTop: 16 }}>
-            Return to Main Menu
-          </button>
-        )}
       </div>
-    </div>
+    </>
   );
 }
 
@@ -1874,5 +2037,5 @@ const overlayCard = {
   borderRadius: 16,
   padding: 22,
   width: "100%",
-  maxWidth: 340,
+  maxWidth: "min(420px, 90vw)",
 };
