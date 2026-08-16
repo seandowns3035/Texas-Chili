@@ -52,6 +52,49 @@ function ColorDot({ color, size = 8 }) {
   );
 }
 
+function Toggle({ checked, onChange, label }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        justifyContent: "space-between",
+        alignItems: "center",
+        padding: "9px 2px",
+      }}
+    >
+      <span style={{ fontSize: 14, color: T.ink, fontFamily: DISPLAY_FONT }}>{label}</span>
+      <button
+        onClick={onChange}
+        aria-pressed={checked}
+        aria-label={label}
+        style={{
+          width: 44,
+          height: 26,
+          borderRadius: 99,
+          border: "none",
+          padding: 3,
+          background: checked ? T.brass : "#d8d0ba",
+          display: "flex",
+          justifyContent: checked ? "flex-end" : "flex-start",
+          transition: "background 150ms ease",
+        }}
+      >
+        <span
+          style={{
+            width: 20,
+            height: 20,
+            borderRadius: 99,
+            background: "#fff",
+            display: "block",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            transition: "transform 150ms ease",
+          }}
+        />
+      </button>
+    </div>
+  );
+}
+
 /* ============================== CARD ENGINE ============================== */
 const SUITS = ["C", "D", "H", "S"];
 const SUIT_SYMBOL = { C: "♣", D: "♦", H: "♥", S: "♠" };
@@ -194,6 +237,26 @@ function loadSession() {
 function clearSession() {
   try {
     localStorage.removeItem(SESSION_KEY);
+  } catch (e) {
+    /* ignore */
+  }
+}
+
+/* Turn chime / turn flash on-off preferences — per-device, not shared
+   game state, so these live in localStorage rather than the room. */
+const CHIME_PREF_KEY = "texasChiliChimeEnabled";
+const FLASH_PREF_KEY = "texasChiliFlashEnabled";
+function loadBoolPref(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : raw === "true";
+  } catch (e) {
+    return fallback;
+  }
+}
+function saveBoolPref(key, value) {
+  try {
+    localStorage.setItem(key, String(value));
   } catch (e) {
     /* ignore */
   }
@@ -755,6 +818,23 @@ export default function App() {
   const audioCtxRef = useRef(null);
   const prevTurnIdRef = useRef(null);
   const [shareCopied, setShareCopied] = useState(false);
+  const [chimeEnabled, setChimeEnabled] = useState(() => loadBoolPref(CHIME_PREF_KEY, true));
+  const [flashEnabled, setFlashEnabled] = useState(() => loadBoolPref(FLASH_PREF_KEY, true));
+
+  function toggleChime() {
+    setChimeEnabled((prev) => {
+      const next = !prev;
+      saveBoolPref(CHIME_PREF_KEY, next);
+      return next;
+    });
+  }
+  function toggleFlash() {
+    setFlashEnabled((prev) => {
+      const next = !prev;
+      saveBoolPref(FLASH_PREF_KEY, next);
+      return next;
+    });
+  }
 
   // Web Audio needs to start from a real user tap (iOS policy) — call this
   // inside any button's onClick on the entry screen so it's ready later
@@ -879,13 +959,15 @@ export default function App() {
     if (!turnChanged) return;
 
     const shouldAlert = room.practiceMode ? true : room.currentTurnId === myId;
-    if (shouldAlert) {
+    if (!shouldAlert) return;
+
+    if (chimeEnabled) playChime();
+    if (flashEnabled) {
       setTurnFlash(true);
-      playChime();
       const t = setTimeout(() => setTurnFlash(false), 900);
       return () => clearTimeout(t);
     }
-  }, [room?.currentTurnId, room?.status, room?.practiceMode, myId]);
+  }, [room?.currentTurnId, room?.status, room?.practiceMode, myId, chimeEnabled, flashEnabled]);
 
   async function createRoom() {
     primeAudio();
@@ -1544,6 +1626,10 @@ export default function App() {
       {showMenu && (
         <GameMenu
           code={code}
+          chimeEnabled={chimeEnabled}
+          flashEnabled={flashEnabled}
+          onToggleChime={toggleChime}
+          onToggleFlash={toggleFlash}
           onLeave={leaveToMenu}
           onRequestEndTable={() => {
             setShowMenu(false);
@@ -1571,7 +1657,7 @@ export default function App() {
   );
 }
 
-function GameMenu({ code, onLeave, onRequestEndTable, onClose }) {
+function GameMenu({ code, chimeEnabled, flashEnabled, onToggleChime, onToggleFlash, onLeave, onRequestEndTable, onClose }) {
   return (
     <div
       style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }}
@@ -1589,9 +1675,16 @@ function GameMenu({ code, onLeave, onRequestEndTable, onClose }) {
       >
         <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.ink, marginBottom: 4 }}>Menu</div>
         <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, letterSpacing: 1, marginBottom: 2 }}>ROOM CODE</div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 28, fontWeight: 700, color: T.brassDim, letterSpacing: 4, marginBottom: 16 }}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 28, fontWeight: 700, color: T.brassDim, letterSpacing: 4, marginBottom: 12 }}>
           {code}
         </div>
+
+        <div style={{ borderTop: "1px solid #e3dbc4", borderBottom: "1px solid #e3dbc4", marginBottom: 16 }}>
+          <Toggle checked={chimeEnabled} onChange={onToggleChime} label="Turn Chime" />
+          <div style={{ borderTop: "1px solid #ece5d2" }} />
+          <Toggle checked={flashEnabled} onChange={onToggleFlash} label="Turn Flash" />
+        </div>
+
         <button
           onClick={onLeave}
           style={{ ...buttonSecondary, width: "100%", color: T.ink, border: "1px solid #cfc6ac", marginBottom: 10 }}
