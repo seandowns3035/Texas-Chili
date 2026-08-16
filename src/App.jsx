@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { db } from "./firebase.js";
-import { ref, set, get, onValue } from "firebase/database";
+import { ref, set, get, remove, onValue } from "firebase/database";
 
 /* ============================== THEME ============================== */
 const T = {
@@ -139,10 +139,18 @@ function sanitizeId(str) {
   return str.trim().replace(/[.#$/[\]]/g, "").slice(0, 24);
 }
 
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
 async function loadRoom(code) {
   try {
     const snap = await get(roomRef(code));
-    return snap.exists() ? hydrateRoom(snap.val()) : null;
+    if (!snap.exists()) return null;
+    const room = hydrateRoom(snap.val());
+    if (room.createdAt && Date.now() - room.createdAt > THIRTY_DAYS_MS) {
+      await remove(roomRef(code));
+      return null;
+    }
+    return room;
   } catch (e) {
     console.error("load failed", e);
     return null;
@@ -155,6 +163,13 @@ async function saveRoom(code, room) {
     console.error("save failed", e);
   }
   return room;
+}
+async function deleteRoom(code) {
+  try {
+    await remove(roomRef(code));
+  } catch (e) {
+    console.error("delete failed", e);
+  }
 }
 
 function makeCode() {
@@ -576,14 +591,26 @@ export default function App() {
   const [selectedCard, setSelectedCard] = useState(null);
   const [showLedger, setShowLedger] = useState(false);
   const [kittyFlash, setKittyFlash] = useState(null);
+  const [showMenu, setShowMenu] = useState(false);
+  const [confirmEndTable, setConfirmEndTable] = useState(false);
   const seenKittyId = useRef(null);
 
   // Realtime subscription — replaces polling entirely. Firebase pushes
   // updates the moment another player's device writes a change.
   useEffect(() => {
     if (screen === "entry" || !code) return;
+    let sawRoom = false;
     const unsubscribe = onValue(roomRef(code), (snap) => {
-      if (snap.exists()) setRoom(hydrateRoom(snap.val()));
+      if (snap.exists()) {
+        sawRoom = true;
+        setRoom(hydrateRoom(snap.val()));
+      } else if (sawRoom) {
+        // The room existed and is now gone — someone ended the table.
+        setRoom(null);
+        setCode(null);
+        setScreen("entry");
+        setError("This table has ended.");
+      }
     });
     return () => unsubscribe();
   }, [screen, code]);
@@ -615,6 +642,7 @@ export default function App() {
     const newRoom = {
       code: newCode,
       maxPlayers: desiredPlayers,
+      createdAt: Date.now(),
       players: [{ id: pid, name: pid }],
       turnOrder: [pid],
       status: "lobby",
@@ -648,6 +676,7 @@ export default function App() {
     const newRoom = {
       code: newCode,
       maxPlayers: desiredPlayers,
+      createdAt: Date.now(),
       practiceMode: true,
       players,
       turnOrder,
@@ -718,6 +747,27 @@ export default function App() {
     r = startRound(r, room.round + 1);
     await saveRoom(code, r);
     setRoom(r);
+  }
+
+  // Returns just this device to the main menu. The table itself keeps
+  // existing in Firebase — other players are unaffected.
+  function leaveToMenu() {
+    setShowMenu(false);
+    setScreen("entry");
+    setCode(null);
+    setMyId(null);
+    setRoom(null);
+    setSelectedCard(null);
+    setError("");
+  }
+
+  // Deletes the table entirely. Every connected device (including this
+  // one, via the realtime listener) gets bounced back to the main menu.
+  async function endTable() {
+    if (!code) return;
+    await deleteRoom(code);
+    setConfirmEndTable(false);
+    setShowMenu(false);
   }
 
   /* ---------------- ENTRY SCREEN ---------------- */
@@ -886,6 +936,23 @@ export default function App() {
               </div>
             )}
           </div>
+
+          <button
+            onClick={leaveToMenu}
+            style={{
+              width: "100%",
+              marginTop: 14,
+              background: "transparent",
+              border: "none",
+              color: T.cream,
+              opacity: 0.5,
+              fontSize: 12,
+              textDecoration: "underline",
+              fontFamily: DISPLAY_FONT,
+            }}
+          >
+            Leave this table
+          </button>
         </div>
       </div>
     );
@@ -911,8 +978,33 @@ export default function App() {
       }}
     >
       {/* Top bar */}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "14px 16px 6px" }}>
-        <div>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: 8,
+          padding: "14px 16px 6px",
+          paddingTop: "max(14px, env(safe-area-inset-top))",
+        }}
+      >
+        <button
+          onClick={() => setShowMenu(true)}
+          aria-label="Menu"
+          style={{
+            background: "transparent",
+            border: `1px solid ${T.brassDim}`,
+            color: T.brassLight,
+            fontSize: 16,
+            width: 34,
+            height: 34,
+            borderRadius: 8,
+            flexShrink: 0,
+          }}
+        >
+          ☰
+        </button>
+        <div style={{ flex: 1, textAlign: "center" }}>
           <div style={{ fontSize: 10, color: T.brassLight, letterSpacing: 2, opacity: 0.8 }}>
             ROUND {room.round} / 6{room.practiceMode ? " · PRACTICE" : ""}
           </div>
@@ -930,6 +1022,7 @@ export default function App() {
             padding: "7px 12px",
             borderRadius: 8,
             fontFamily: DISPLAY_FONT,
+            flexShrink: 0,
           }}
         >
           Ledger
@@ -1053,6 +1146,7 @@ export default function App() {
           background: T.panel,
           borderTop: `2px solid ${T.feltLine}`,
           padding: "12px 10px 18px",
+          paddingBottom: "max(18px, env(safe-area-inset-bottom))",
         }}
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 8px" }}>
@@ -1102,10 +1196,93 @@ export default function App() {
 
       {kittyFlash && <KittyFlash event={kittyFlash} nameOf={nameOf} />}
 
+      {showMenu && (
+        <GameMenu
+          onLeave={leaveToMenu}
+          onRequestEndTable={() => {
+            setShowMenu(false);
+            setConfirmEndTable(true);
+          }}
+          onClose={() => setShowMenu(false)}
+        />
+      )}
+
+      {confirmEndTable && (
+        <ConfirmDialog
+          title="End this table?"
+          body="This deletes the table for everyone at it, right now. This can't be undone."
+          confirmLabel="End Table"
+          onConfirm={endTable}
+          onCancel={() => setConfirmEndTable(false)}
+        />
+      )}
+
       {room.status === "round-end" && (
         <RoundEndOverlay room={room} nameOf={nameOf} onContinue={continueToNextRound} />
       )}
-      {room.status === "game-end" && <GameEndOverlay room={room} nameOf={nameOf} />}
+      {room.status === "game-end" && <GameEndOverlay room={room} nameOf={nameOf} onLeave={leaveToMenu} />}
+    </div>
+  );
+}
+
+function GameMenu({ onLeave, onRequestEndTable, onClose }) {
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: T.cream,
+          width: "100%",
+          borderRadius: "16px 16px 0 0",
+          borderTop: `3px solid ${T.brass}`,
+          padding: "18px 14px calc(24px + env(safe-area-inset-bottom))",
+        }}
+      >
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.ink, marginBottom: 14 }}>Menu</div>
+        <button
+          onClick={onLeave}
+          style={{ ...buttonSecondary, width: "100%", color: T.ink, border: "1px solid #cfc6ac", marginBottom: 10 }}
+        >
+          Return to Main Menu
+        </button>
+        <div style={{ fontSize: 11, color: T.ink, opacity: 0.5, marginBottom: 14, textAlign: "center" }}>
+          This only leaves for you — the table keeps going for everyone else.
+        </div>
+        <button
+          onClick={onRequestEndTable}
+          style={{ ...buttonSecondary, width: "100%", color: "#A3312A", border: "1px solid #A3312A" }}
+        >
+          End Table for Everyone
+        </button>
+        <button
+          onClick={onClose}
+          style={{ width: "100%", marginTop: 10, background: "transparent", border: "none", color: T.ink, opacity: 0.5, fontSize: 13, padding: 8 }}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmDialog({ title, body, confirmLabel, onConfirm, onCancel }) {
+  return (
+    <div style={{ ...overlayWrap, zIndex: 80 }}>
+      <div style={overlayCard}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.cream, marginBottom: 8 }}>{title}</div>
+        <div style={{ fontSize: 13, color: T.cream, opacity: 0.75, marginBottom: 18 }}>{body}</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onCancel} style={{ ...buttonSecondary, flex: 1 }}>
+            Cancel
+          </button>
+          <button onClick={onConfirm} style={{ ...buttonPrimary, flex: 1, background: "#A3312A", color: T.cream }}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1138,7 +1315,7 @@ function RoundEndOverlay({ room, nameOf, onContinue }) {
   );
 }
 
-function GameEndOverlay({ room, nameOf }) {
+function GameEndOverlay({ room, nameOf, onLeave }) {
   const totals = room.turnOrder.map((pid) => ({
     pid,
     total: [1, 2, 3, 4, 5, 6].reduce((s, r) => s + ((room.scores[pid] || {})[r] || 0), 0),
@@ -1165,6 +1342,11 @@ function GameEndOverlay({ room, nameOf }) {
         <div style={{ fontSize: 11, color: T.cream, opacity: 0.5, marginTop: 14, textAlign: "center" }}>
           Lowest total wins. Start a new table to play again.
         </div>
+        {onLeave && (
+          <button onClick={onLeave} style={{ ...buttonPrimary, width: "100%", marginTop: 16 }}>
+            Return to Main Menu
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1177,7 +1359,9 @@ const outerWrap = {
   display: "flex",
   alignItems: "center",
   justifyContent: "center",
-  padding: 20,
+  padding: "20px",
+  paddingTop: "max(20px, env(safe-area-inset-top))",
+  paddingBottom: "max(20px, env(safe-area-inset-bottom))",
   fontFamily: "system-ui, -apple-system, sans-serif",
 };
 const panelStyle = {
