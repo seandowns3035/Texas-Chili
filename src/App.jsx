@@ -461,6 +461,86 @@ function KittyFlash({ event, nameOf }) {
   );
 }
 
+function CapturedView({ room, myId, nameOf, onClose }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.6)",
+        zIndex: 50,
+        display: "flex",
+        alignItems: "flex-end",
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: T.cream,
+          width: "100%",
+          maxHeight: "80vh",
+          overflowY: "auto",
+          borderRadius: "16px 16px 0 0",
+          borderTop: `3px solid ${T.brass}`,
+          padding: "18px 14px calc(24px + env(safe-area-inset-bottom))",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <div style={{ fontFamily: DISPLAY_FONT, fontSize: 20, fontWeight: 700, color: T.ink }}>Cards Captured</div>
+          <button onClick={onClose} className="text-sm" style={{ color: T.ink, opacity: 0.6 }}>
+            Close
+          </button>
+        </div>
+        <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, marginBottom: 16 }}>
+          Every card won in a trick so far this round — resets when the next round deals.
+        </div>
+        {room.turnOrder.map((pid) => {
+          const cards = (room.capturedCards?.[pid] || [])
+            .slice()
+            .sort((a, b) => {
+              const si = SUITS.indexOf(a.suit) - SUITS.indexOf(b.suit);
+              if (si !== 0) return si;
+              return rankValue(a.rank) - rankValue(b.rank);
+            });
+          return (
+            <div key={pid} style={{ marginBottom: 16 }}>
+              <div style={{ fontFamily: DISPLAY_FONT, fontSize: 14, fontWeight: 700, color: T.ink, marginBottom: 6 }}>
+                {nameOf(pid)}
+                {pid === myId ? " (you)" : ""} — {cards.length} card{cards.length === 1 ? "" : "s"}
+              </div>
+              {cards.length === 0 ? (
+                <div style={{ fontSize: 12, color: T.ink, opacity: 0.45 }}>No tricks captured yet.</div>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                  {cards.map((c, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        fontSize: 13,
+                        fontFamily: DISPLAY_FONT,
+                        fontWeight: 600,
+                        padding: "3px 7px",
+                        borderRadius: 6,
+                        border: "1px solid #cfc6ac",
+                        color: isRedSuit(c.suit) ? T.red : T.black,
+                        background: "#fff",
+                      }}
+                    >
+                      {RANK_LABEL[c.rank] || c.rank}
+                      {SUIT_SYMBOL[c.suit]}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function Ledger({ room, myId, onClose }) {
   const rounds = [1, 2, 3, 4, 5, 6];
   const totals = {};
@@ -590,6 +670,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [selectedCard, setSelectedCard] = useState(null);
   const [showLedger, setShowLedger] = useState(false);
+  const [showCaptured, setShowCaptured] = useState(false);
   const [kittyFlash, setKittyFlash] = useState(null);
   const [showMenu, setShowMenu] = useState(false);
   const [confirmEndTable, setConfirmEndTable] = useState(false);
@@ -1012,21 +1093,36 @@ export default function App() {
             {ROUND_META[room.round]?.label}
           </div>
         </div>
-        <button
-          onClick={() => setShowLedger(true)}
-          style={{
-            background: "transparent",
-            border: `1px solid ${T.brassDim}`,
-            color: T.brassLight,
-            fontSize: 12,
-            padding: "7px 12px",
-            borderRadius: 8,
-            fontFamily: DISPLAY_FONT,
-            flexShrink: 0,
-          }}
-        >
-          Ledger
-        </button>
+        <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <button
+            onClick={() => setShowCaptured(true)}
+            style={{
+              background: "transparent",
+              border: `1px solid ${T.brassDim}`,
+              color: T.brassLight,
+              fontSize: 12,
+              padding: "7px 10px",
+              borderRadius: 8,
+              fontFamily: DISPLAY_FONT,
+            }}
+          >
+            Captured
+          </button>
+          <button
+            onClick={() => setShowLedger(true)}
+            style={{
+              background: "transparent",
+              border: `1px solid ${T.brassDim}`,
+              color: T.brassLight,
+              fontSize: 12,
+              padding: "7px 12px",
+              borderRadius: 8,
+              fontFamily: DISPLAY_FONT,
+            }}
+          >
+            Ledger
+          </button>
+        </div>
       </div>
 
       {/* Opponents grid — wraps to fit anywhere from 2 to 9 opponents */}
@@ -1166,33 +1262,39 @@ export default function App() {
         <div
           style={{
             display: "flex",
+            flexWrap: "wrap",
             gap: 6,
-            overflowX: "auto",
             paddingBottom: 4,
           }}
         >
-          {myHand.map((c) => {
+          {myHand.map((c, i) => {
             const legal = isMyTurn && canPlayCard(myHand, c, room.leadSuit, forcedCardForHand);
             const isSelected = selectedCard && selectedCard.rank === c.rank && selectedCard.suit === c.suit;
+            const newSuitGroup = i > 0 && myHand[i - 1].suit !== c.suit;
             return (
-              <PlayingCard
-                key={cardId(c)}
-                card={c}
-                size="md"
-                dim={isMyTurn && !legal}
-                selected={isSelected}
-                onClick={
-                  legal
-                    ? () => setSelectedCard(isSelected ? null : c)
-                    : undefined
-                }
-              />
+              <div key={cardId(c)} style={{ marginLeft: newSuitGroup ? 10 : 0 }}>
+                <PlayingCard
+                  card={c}
+                  size="md"
+                  dim={isMyTurn && !legal}
+                  selected={isSelected}
+                  onClick={
+                    legal
+                      ? () => setSelectedCard(isSelected ? null : c)
+                      : undefined
+                  }
+                />
+              </div>
             );
           })}
         </div>
       </div>
 
       {showLedger && <Ledger room={room} myId={myId} onClose={() => setShowLedger(false)} />}
+
+      {showCaptured && (
+        <CapturedView room={room} myId={myId} nameOf={nameOf} onClose={() => setShowCaptured(false)} />
+      )}
 
       {kittyFlash && <KittyFlash event={kittyFlash} nameOf={nameOf} />}
 
