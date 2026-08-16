@@ -19,6 +19,39 @@ const T = {
 };
 const DISPLAY_FONT = '"Iowan Old Style", "Palatino Linotype", Georgia, serif';
 
+/* Fixed per-seat colors (by position in turnOrder, not by name) so every
+   player has a stable color for the life of the table, up to 10 players. */
+const SEAT_COLORS = [
+  "#E6C766", // brass/gold
+  "#7FB8A4", // teal-green
+  "#E8956B", // coral
+  "#8FA8E6", // periwinkle
+  "#D97BAE", // rose
+  "#A8D46F", // lime
+  "#C77DD9", // lavender
+  "#66C7C2", // aqua
+  "#E0A5E6", // orchid
+  "#B0B8C4", // slate
+];
+function seatColor(room, pid) {
+  const i = room.turnOrder.indexOf(pid);
+  return SEAT_COLORS[i >= 0 ? i % SEAT_COLORS.length : 0];
+}
+function ColorDot({ color, size = 8 }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        width: size,
+        height: size,
+        borderRadius: 99,
+        background: color,
+        flexShrink: 0,
+      }}
+    />
+  );
+}
+
 /* ============================== CARD ENGINE ============================== */
 const SUITS = ["C", "D", "H", "S"];
 const SUIT_SYMBOL = { C: "♣", D: "♦", H: "♥", S: "♠" };
@@ -137,6 +170,33 @@ function hydrateRoom(raw) {
    which forbids . # $ [ ] / in keys. Strip anything unsafe. */
 function sanitizeId(str) {
   return str.trim().replace(/[.#$/[\]]/g, "").slice(0, 24);
+}
+
+/* Remember the last table this device was at, so a dropped connection,
+   an accidental tab close, or a phone restart can rejoin automatically
+   instead of forcing a retype of name + room code. */
+const SESSION_KEY = "texasChiliSession";
+function saveSession(code, name) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({ code, name }));
+  } catch (e) {
+    /* ignore — private browsing etc. */
+  }
+}
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+function clearSession() {
+  try {
+    localStorage.removeItem(SESSION_KEY);
+  } catch (e) {
+    /* ignore */
+  }
 }
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
@@ -505,7 +565,19 @@ function CapturedView({ room, myId, nameOf, onClose }) {
             });
           return (
             <div key={pid} style={{ marginBottom: 16 }}>
-              <div style={{ fontFamily: DISPLAY_FONT, fontSize: 14, fontWeight: 700, color: T.ink, marginBottom: 6 }}>
+              <div
+                style={{
+                  fontFamily: DISPLAY_FONT,
+                  fontSize: 14,
+                  fontWeight: 700,
+                  color: T.ink,
+                  marginBottom: 6,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                }}
+              >
+                <ColorDot color={seatColor(room, pid)} />
                 {nameOf(pid)}
                 {pid === myId ? " (you)" : ""} — {cards.length} card{cards.length === 1 ? "" : "s"}
               </div>
@@ -600,7 +672,10 @@ function Ledger({ room, myId, onClose }) {
                         fontWeight: pid === myId ? 700 : 500,
                       }}
                     >
-                      {p?.name || pid}
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                        <ColorDot color={seatColor(room, pid)} size={7} />
+                        {p?.name || pid}
+                      </span>
                     </th>
                   );
                 })}
@@ -674,7 +749,77 @@ export default function App() {
   const [kittyFlash, setKittyFlash] = useState(null);
   const [showMenu, setShowMenu] = useState(false);
   const [confirmEndTable, setConfirmEndTable] = useState(false);
+  const [autoRejoining, setAutoRejoining] = useState(true);
+  const [turnFlash, setTurnFlash] = useState(false);
   const seenKittyId = useRef(null);
+  const audioCtxRef = useRef(null);
+  const wasMyTurnRef = useRef(false);
+  const [shareCopied, setShareCopied] = useState(false);
+
+  // Web Audio needs to start from a real user tap (iOS policy) — call this
+  // inside any button's onClick on the entry screen so it's ready later
+  // when we need to play a chime with no direct user gesture attached.
+  function primeAudio() {
+    try {
+      if (!audioCtxRef.current) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx) audioCtxRef.current = new Ctx();
+      }
+      if (audioCtxRef.current && audioCtxRef.current.state === "suspended") {
+        audioCtxRef.current.resume();
+      }
+    } catch (e) {
+      /* ignore — chime just won't play */
+    }
+  }
+  function playChime() {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = "sine";
+      o.frequency.value = 830;
+      g.gain.setValueAtTime(0.0001, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.16, ctx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.4);
+      o.connect(g);
+      g.connect(ctx.destination);
+      o.start();
+      o.stop(ctx.currentTime + 0.42);
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  // On load, try to silently rejoin whatever table this device was last
+  // at — covers a dropped connection, a closed tab, or a phone restart,
+  // without the player having to retype their name and the room code.
+  useEffect(() => {
+    (async () => {
+      const session = loadSession();
+      if (!session) {
+        const params = new URLSearchParams(window.location.search);
+        const joinParam = params.get("join");
+        if (joinParam) setCodeInput(joinParam.trim().toUpperCase());
+        setAutoRejoining(false);
+        return;
+      }
+      setName(session.name);
+      const r = await loadRoom(session.code);
+      const pid = sanitizeId(session.name);
+      if (r && r.players.some((p) => p.id === pid)) {
+        setCode(session.code);
+        setMyId(pid);
+        setRoom(r);
+        seenKittyId.current = r.kittyReveal ? r.kittyReveal.id : null;
+        setScreen(r.status === "lobby" ? "lobby" : "game");
+      } else {
+        clearSession();
+      }
+      setAutoRejoining(false);
+    })();
+  }, []);
 
   // Realtime subscription — replaces polling entirely. Firebase pushes
   // updates the moment another player's device writes a change.
@@ -687,6 +832,7 @@ export default function App() {
         setRoom(hydrateRoom(snap.val()));
       } else if (sawRoom) {
         // The room existed and is now gone — someone ended the table.
+        clearSession();
         setRoom(null);
         setCode(null);
         setScreen("entry");
@@ -715,7 +861,28 @@ export default function App() {
     }
   }, [room?.kittyReveal?.id]);
 
+  // Turn alert: a brief flash + chime the moment it becomes this player's
+  // turn (not every render while it's already their turn). Real vibration
+  // isn't available — iOS Safari has never supported navigator.vibrate(),
+  // even as an installed home-screen app — so this is the reliable stand-in.
+  useEffect(() => {
+    if (!room || room.status !== "playing") {
+      wasMyTurnRef.current = false;
+      return;
+    }
+    const isMyTurnNow = room.practiceMode ? true : room.currentTurnId === myId;
+    if (isMyTurnNow && !wasMyTurnRef.current) {
+      setTurnFlash(true);
+      playChime();
+      const t = setTimeout(() => setTurnFlash(false), 900);
+      wasMyTurnRef.current = true;
+      return () => clearTimeout(t);
+    }
+    wasMyTurnRef.current = isMyTurnNow;
+  }, [room?.currentTurnId, room?.status, myId]);
+
   async function createRoom() {
+    primeAudio();
     if (!name.trim()) return setError("Enter your name first.");
     const newCode = makeCode();
     const pid = sanitizeId(name);
@@ -736,11 +903,13 @@ export default function App() {
     setMyId(pid);
     setRoom(newRoom);
     seenKittyId.current = null;
+    saveSession(newCode, name.trim());
     setScreen("lobby");
     setError("");
   }
 
   async function startSoloTest() {
+    primeAudio();
     if (!name.trim()) return setError("Enter your name first.");
     const newCode = makeCode();
     const pid = sanitizeId(name);
@@ -771,11 +940,13 @@ export default function App() {
     setMyId(pid);
     setRoom(newRoom);
     seenKittyId.current = null;
+    saveSession(newCode, name.trim());
     setScreen("lobby");
     setError("");
   }
 
   async function joinRoom() {
+    primeAudio();
     if (!name.trim()) return setError("Enter your name first.");
     const c = codeInput.trim().toUpperCase();
     if (!c) return setError("Enter a room code.");
@@ -798,6 +969,7 @@ export default function App() {
     // Joining mid-round: treat whatever kitty state already exists as the
     // baseline so we don't flash an award that happened before we connected.
     seenKittyId.current = r.kittyReveal ? r.kittyReveal.id : null;
+    saveSession(c, name.trim());
     setScreen(r.status === "lobby" ? "lobby" : "game");
     setError("");
   }
@@ -833,6 +1005,7 @@ export default function App() {
   // Returns just this device to the main menu. The table itself keeps
   // existing in Firebase — other players are unaffected.
   function leaveToMenu() {
+    clearSession();
     setShowMenu(false);
     setScreen("entry");
     setCode(null);
@@ -847,8 +1020,38 @@ export default function App() {
   async function endTable() {
     if (!code) return;
     await deleteRoom(code);
+    clearSession();
     setConfirmEndTable(false);
     setShowMenu(false);
+  }
+
+  async function shareInvite() {
+    if (!code) return;
+    const url = `${window.location.origin}${window.location.pathname}?join=${code}`;
+    const text = `Join my Texas Chili table! Room code: ${code}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: "Texas Chili", text, url });
+      } catch (e) {
+        /* user cancelled the share sheet — not an error */
+      }
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(`${text}\n${url}`);
+      setShareCopied(true);
+      setTimeout(() => setShareCopied(false), 2000);
+    } catch (e) {
+      /* clipboard unavailable — nothing more we can do here */
+    }
+  }
+
+  if (autoRejoining) {
+    return (
+      <div style={outerWrap}>
+        <div style={{ color: T.cream, opacity: 0.7 }}>Reconnecting…</div>
+      </div>
+    );
   }
 
   /* ---------------- ENTRY SCREEN ---------------- */
@@ -969,6 +1172,21 @@ export default function App() {
             <div style={{ fontSize: 12, color: T.cream, opacity: 0.55, marginTop: 4 }}>
               Share this code with the other players
             </div>
+            <button
+              onClick={shareInvite}
+              style={{
+                marginTop: 12,
+                background: "transparent",
+                border: `1px solid ${T.brassDim}`,
+                color: T.brassLight,
+                fontSize: 13,
+                padding: "9px 18px",
+                borderRadius: 10,
+                fontFamily: DISPLAY_FONT,
+              }}
+            >
+              {shareCopied ? "Copied!" : "Share Invite"}
+            </button>
           </div>
 
           <div style={panelStyle}>
@@ -994,7 +1212,7 @@ export default function App() {
                         width: 8,
                         height: 8,
                         borderRadius: 99,
-                        background: p ? T.brassLight : "#3a5a4c",
+                        background: p ? seatColor(room, p.id) : "#3a5a4c",
                       }}
                     />
                     <div style={{ color: p ? T.cream : "#5f7f70", fontSize: 15, fontFamily: DISPLAY_FONT }}>
@@ -1056,6 +1274,8 @@ export default function App() {
         display: "flex",
         flexDirection: "column",
         fontFamily: "system-ui, -apple-system, sans-serif",
+        boxShadow: turnFlash ? `inset 0 0 0 4px ${T.brassLight}` : "inset 0 0 0 0px transparent",
+        transition: "box-shadow 350ms ease",
       }}
     >
       {/* Top bar */}
@@ -1157,8 +1377,13 @@ export default function App() {
                   whiteSpace: "nowrap",
                   overflow: "hidden",
                   textOverflow: "ellipsis",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 5,
                 }}
               >
+                <ColorDot color={seatColor(room, pid)} />
                 {nameOf(pid)}
               </div>
               <div style={{ fontSize: 10, color: T.cream, opacity: 0.55, marginTop: 1 }}>
@@ -1206,7 +1431,19 @@ export default function App() {
             room.currentTrick.map((play) => (
               <div key={play.playerId} style={{ textAlign: "center" }}>
                 <PlayingCard card={play.card} size="md" />
-                <div style={{ fontSize: 10, color: T.cream, opacity: 0.6, marginTop: 4 }}>
+                <div
+                  style={{
+                    fontSize: 10,
+                    color: T.cream,
+                    opacity: 0.6,
+                    marginTop: 4,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 4,
+                  }}
+                >
+                  <ColorDot color={seatColor(room, play.playerId)} size={6} />
                   {nameOf(play.playerId)}
                 </div>
               </div>
@@ -1300,6 +1537,7 @@ export default function App() {
 
       {showMenu && (
         <GameMenu
+          code={code}
           onLeave={leaveToMenu}
           onRequestEndTable={() => {
             setShowMenu(false);
@@ -1327,7 +1565,7 @@ export default function App() {
   );
 }
 
-function GameMenu({ onLeave, onRequestEndTable, onClose }) {
+function GameMenu({ code, onLeave, onRequestEndTable, onClose }) {
   return (
     <div
       style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }}
@@ -1343,7 +1581,11 @@ function GameMenu({ onLeave, onRequestEndTable, onClose }) {
           padding: "18px 14px calc(24px + env(safe-area-inset-bottom))",
         }}
       >
-        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.ink, marginBottom: 14 }}>Menu</div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 18, fontWeight: 700, color: T.ink, marginBottom: 4 }}>Menu</div>
+        <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, letterSpacing: 1, marginBottom: 2 }}>ROOM CODE</div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 28, fontWeight: 700, color: T.brassDim, letterSpacing: 4, marginBottom: 16 }}>
+          {code}
+        </div>
         <button
           onClick={onLeave}
           style={{ ...buttonSecondary, width: "100%", color: T.ink, border: "1px solid #cfc6ac", marginBottom: 10 }}
@@ -1405,7 +1647,10 @@ function RoundEndOverlay({ room, nameOf, onContinue }) {
         )}
         {entries.map((e) => (
           <div key={e.pid} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #234838" }}>
-            <span style={{ color: T.cream, fontSize: 14 }}>{nameOf(e.pid)}</span>
+            <span style={{ color: T.cream, fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}>
+              <ColorDot color={seatColor(room, e.pid)} />
+              {nameOf(e.pid)}
+            </span>
             <span style={{ color: T.brassLight, fontSize: 14, fontVariantNumeric: "tabular-nums" }}>+{e.pts}</span>
           </div>
         ))}
@@ -1433,7 +1678,8 @@ function GameEndOverlay({ room, nameOf, onLeave }) {
         </div>
         {totals.map((e, i) => (
           <div key={e.pid} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #234838" }}>
-            <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontWeight: i === 0 ? 700 : 400 }}>
+            <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontWeight: i === 0 ? 700 : 400, display: "flex", alignItems: "center", gap: 6 }}>
+              <ColorDot color={seatColor(room, e.pid)} />
               {i + 1}. {nameOf(e.pid)}
             </span>
             <span style={{ color: i === 0 ? T.brassLight : T.cream, fontSize: 14, fontVariantNumeric: "tabular-nums" }}>
