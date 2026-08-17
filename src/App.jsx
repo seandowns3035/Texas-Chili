@@ -472,6 +472,170 @@ function checkEarlyRoundEnd(room) {
   return { done: false, reason: null };
 }
 
+/* ============================== BOT AI ==============================
+   Every scoring rule in this game is a penalty, not a reward, so the bot's
+   whole posture is defensive by default: avoid winning, dump danger cards
+   the moment it's safe to, never volunteer a disaster. Round 5 flips that
+   for most of the round (winning keeps the lead, which lets the bot choose
+   what gets led), and hearts get a deliberate baiting exception. The bot
+   only ever reasons from information a real player would actually have —
+   its own hand plus everything publicly captured/played — never anyone
+   else's hand contents. */
+
+function getUnseenCards(room, botId) {
+  const seen = new Set();
+  (room.hands[botId] || []).forEach((c) => seen.add(cardId(c)));
+  Object.values(room.capturedCards || {}).forEach((arr) => arr.forEach((c) => seen.add(cardId(c))));
+  (room.currentTrick || []).forEach((p) => seen.add(cardId(p.card)));
+  return buildDeck().filter((c) => !seen.has(cardId(c)));
+}
+
+function highestRank(cards) {
+  return cards.length ? Math.max(...cards.map((c) => rankValue(c.rank))) : 0;
+}
+
+function chooseBotCard(room, botId) {
+  const hand = room.hands[botId] || [];
+  if (hand.length === 1) return hand[0]; // forced — the round's true "last trick" moment
+
+  const round = room.round;
+  const wantsQueens = round === 2 || round === 6;
+  const wantsHearts = round === 3 || round === 6;
+  const wantsKingSpades = round === 4 || round === 6;
+  const wantsLastTrick = round === 5 || round === 6;
+
+  const leadSuit = room.leadSuit;
+  const isLeading = room.currentTrick.length === 0;
+  const forcedOpen = room.trickNumber === 1 && isLeading ? room.forcedOpenCard : null;
+  if (forcedOpen) {
+    return hand.find((c) => c.rank === forcedOpen.rank && c.suit === forcedOpen.suit) || hand[0];
+  }
+
+  const unseen = getUnseenCards(room, botId);
+  const tricksLeft = hand.length;
+
+  function isDanger(c) {
+    return (
+      (wantsKingSpades && c.rank === "K" && c.suit === "S") ||
+      (wantsHearts && c.suit === "H") ||
+      (wantsQueens && c.rank === "Q")
+    );
+  }
+  // A card this bot is guaranteed to win with whenever it's eventually
+  // played into a trick of its own suit — no unseen card of that suit
+  // outranks it. Worth protecting for a Round 5 endgame strike.
+  function isControlCard(c) {
+    const rivalRanks = unseen.filter((u) => u.suit === c.suit);
+    return rankValue(c.rank) > highestRank(rivalRanks);
+  }
+  const byRankAsc = (a, b) => rankValue(a.rank) - rankValue(b.rank);
+  const byRankDesc = (a, b) => rankValue(b.rank) - rankValue(a.rank);
+
+  // Winning the second-to-last trick of the round means YOU lead the true
+  // last trick — and since it's forced (one card each), whatever single
+  // card you have left sets the suit everyone else measures against. If
+  // that leftover card isn't a genuine control card, leading it is close
+  // to a coin-flip loss. So at exactly two tricks left, only chase a win
+  // if doing so leaves a guaranteed winner behind for the real finale.
+  function setsUpFinalWin(candidateCard) {
+    if (tricksLeft !== 2) return true;
+    const remaining = hand.filter((c) => !(c.rank === candidateCard.rank && c.suit === candidateCard.suit));
+    return remaining.length === 1 && isControlCard(remaining[0]);
+  }
+
+  /* ---------------- LEADING ---------------- */
+  if (isLeading) {
+    // Heart-baiting: holding just one or two low hearts is worth leading —
+    // it forces every other heart-holder to follow suit into this trick,
+    // and whoever's sitting on the high hearts gets stuck capturing them.
+    if (wantsHearts) {
+      const hearts = hand.filter((c) => c.suit === "H");
+      if (hearts.length > 0 && hearts.length <= 2) {
+        const lowest = hearts.slice().sort(byRankAsc)[0];
+        if (rankValue(lowest.rank) <= 8) return lowest;
+      }
+    }
+
+    // Round 5 control play: with tricks still to spare, take the lead using
+    // a card that's both safe and not a protected control card — winning
+    // cheaply here costs nothing and keeps the choice of suit in our hands.
+    // At exactly two tricks left, only do this if it sets up a guaranteed
+    // win on the true final trick (see setsUpFinalWin above).
+    if (wantsLastTrick && tricksLeft > 1) {
+      const safe = hand.filter((c) => !isDanger(c) && !isControlCard(c) && setsUpFinalWin(c));
+      if (safe.length > 0) return safe.slice().sort(byRankDesc)[0];
+    }
+
+    // Otherwise: never volunteer a danger card, and hold control cards back.
+    const safeLeads = hand.filter((c) => !isDanger(c));
+    const pool = safeLeads.length > 0 ? safeLeads : hand;
+    const nonControl = pool.filter((c) => !isControlCard(c));
+    const finalPool = nonControl.length > 0 ? nonControl : pool;
+    return finalPool.slice().sort(byRankAsc)[0];
+  }
+
+  /* ---------------- FOLLOWING ---------------- */
+  const followCards = hand.filter((c) => c.suit === leadSuit);
+  const isVoid = followCards.length === 0;
+
+  if (isVoid) {
+    // No off-suit card can ever win — this is the safest possible moment
+    // to unload whatever's most dangerous to be caught holding.
+    if (wantsKingSpades) {
+      const ks = hand.find((c) => c.rank === "K" && c.suit === "S");
+      if (ks) return ks;
+    }
+    if (wantsQueens) {
+      const queens = hand.filter((c) => c.rank === "Q");
+      if (queens.length > 0) return queens[0];
+    }
+    if (wantsHearts) {
+      const hearts = hand.filter((c) => c.suit === "H");
+      if (hearts.length > 0) return hearts.slice().sort(byRankDesc)[0];
+    }
+    const nonControl = hand.filter((c) => !isControlCard(c));
+    const pool = nonControl.length > 0 ? nonControl : hand;
+    return pool.slice().sort(byRankDesc)[0];
+  }
+
+  // Must follow suit — decide whether to duck under or take the trick.
+  const highestSoFar = room.currentTrick.reduce(
+    (best, p) => (p.card.suit === leadSuit && rankValue(p.card.rank) > rankValue(best.rank) ? p.card : best),
+    { rank: "2" }
+  );
+  const threshold = rankValue(highestSoFar.rank);
+  const losers = followCards.filter((c) => rankValue(c.rank) < threshold);
+  const winners = followCards.filter((c) => rankValue(c.rank) > threshold);
+
+  let preferWin = wantsLastTrick && tricksLeft > 1;
+  let winPool = winners;
+  if (wantsLastTrick && tricksLeft === 2) {
+    const setupWinners = winners.filter((c) => setsUpFinalWin(c));
+    preferWin = setupWinners.length > 0;
+    winPool = setupWinners;
+  }
+
+  if (losers.length > 0 && !preferWin) {
+    // Burn the highest card that still safely loses.
+    return losers.slice().sort(byRankDesc)[0];
+  }
+  if (preferWin && winPool.length > 0) {
+    // Win as cheaply as possible among the winning options that are
+    // actually worth taking, protecting control cards where we can.
+    const nonControlWinners = winPool.filter((c) => !isControlCard(c));
+    const pool = nonControlWinners.length > 0 ? nonControlWinners : winPool;
+    return pool.slice().sort(byRankAsc)[0];
+  }
+  if (winners.length > 0) {
+    // No losers available (forced to win) — take it as cheaply as possible.
+    const nonControlWinners = winners.filter((c) => !isControlCard(c));
+    const pool = nonControlWinners.length > 0 ? nonControlWinners : winners;
+    return pool.slice().sort(byRankAsc)[0];
+  }
+  if (losers.length > 0) return losers.slice().sort(byRankDesc)[0];
+  return followCards[0];
+}
+
 /* ============================== SMALL UI PIECES ============================== */
 function PlayingCard({ card, size = "md", faceDown, dim, onClick, selected, won }) {
   const dims = {
@@ -1133,6 +1297,29 @@ export default function App() {
     return () => clearTimeout(t);
   }, [room?.awaitingTrickClear, code]);
 
+  // Bot auto-play: when it's a bot's turn, any connected client computes
+  // its move and submits it after a short pacing delay (so it doesn't feel
+  // instant/robotic). Multiple clients may all detect the same bot turn and
+  // schedule this independently — that's fine. chooseBotCard is a pure
+  // function of the frozen room state, so they'd all compute the identical
+  // card; and as soon as the first write lands, every other client's copy
+  // of room.currentTurnId changes, which cancels their pending timers via
+  // the effect cleanup before a duplicate write can happen in practice.
+  useEffect(() => {
+    if (!room || room.status !== "playing" || room.awaitingTrickClear || !code) return;
+    const currentPlayer = room.players.find((p) => p.id === room.currentTurnId);
+    if (!currentPlayer || !currentPlayer.isBot) return;
+    const t = setTimeout(async () => {
+      let r = JSON.parse(JSON.stringify(room));
+      const card = chooseBotCard(r, room.currentTurnId);
+      if (!card) return;
+      r = playCard(r, room.currentTurnId, card);
+      await saveRoom(code, r);
+      setRoom(r);
+    }, 850);
+    return () => clearTimeout(t);
+  }, [room?.currentTurnId, room?.status, room?.awaitingTrickClear, code]);
+
   // Shuffle animation: plays a brief cosmetic overlay whenever a round
   // actually starts dealing (status transitions into "playing"). The ref
   // starts undefined so the very first time this device observes the room
@@ -1167,7 +1354,7 @@ export default function App() {
     prevTurnIdRef.current = room.currentTurnId;
     if (!turnChanged) return;
 
-    const shouldAlert = room.practiceMode ? true : room.currentTurnId === myId;
+    const shouldAlert = room.currentTurnId === myId;
     if (!shouldAlert) return;
 
     if (chimeEnabled) playChime();
@@ -1176,7 +1363,7 @@ export default function App() {
       const t = setTimeout(() => setTurnFlash(false), 900);
       return () => clearTimeout(t);
     }
-  }, [room?.currentTurnId, room?.status, room?.practiceMode, myId, chimeEnabled, flashEnabled]);
+  }, [room?.currentTurnId, room?.status, myId, chimeEnabled, flashEnabled]);
 
   async function createRoom() {
     primeAudio();
@@ -1205,41 +1392,31 @@ export default function App() {
     setError("");
   }
 
-  async function startSoloTest() {
-    primeAudio();
-    if (!name.trim()) return setError("Enter your name first.");
-    const newCode = makeCode();
-    const pid = sanitizeId(name);
-    if (!pid) return setError("Enter a valid name.");
-    const players = [{ id: pid, name: pid }];
-    const turnOrder = [pid];
-    const scores = { [pid]: {} };
-    for (let i = 2; i <= desiredPlayers; i++) {
-      const botId = `Bot ${i}`;
-      players.push({ id: botId, name: botId });
-      turnOrder.push(botId);
-      scores[botId] = {};
-    }
-    const newRoom = {
-      code: newCode,
-      maxPlayers: desiredPlayers,
-      createdAt: Date.now(),
-      practiceMode: true,
-      players,
-      turnOrder,
-      status: "lobby",
-      round: 0,
-      scores,
-      log: [`${pid} started a solo practice table for ${desiredPlayers}.`],
-    };
-    await saveRoom(newCode, newRoom);
-    setCode(newCode);
-    setMyId(pid);
-    setRoom(newRoom);
-    seenKittyId.current = null;
-    saveSession(newCode, name.trim());
-    setScreen("lobby");
-    setError("");
+  async function addBot() {
+    if (!room || room.players.length >= room.maxPlayers) return;
+    let r = JSON.parse(JSON.stringify(room));
+    const botNum = (r.botCounter || 0) + 1;
+    r.botCounter = botNum;
+    const botId = `bot_${botNum}_${Math.random().toString(36).slice(2, 6)}`;
+    const botName = `Bot ${botNum}`;
+    r.players.push({ id: botId, name: botName, isBot: true });
+    r.turnOrder.push(botId);
+    r.scores[botId] = {};
+    pushLog(r, `${botName} added to the table.`);
+    await saveRoom(code, r);
+    setRoom(r);
+  }
+
+  async function removeBot(pid) {
+    if (!room) return;
+    let r = JSON.parse(JSON.stringify(room));
+    const bot = r.players.find((p) => p.id === pid);
+    r.players = r.players.filter((p) => p.id !== pid);
+    r.turnOrder = r.turnOrder.filter((id) => id !== pid);
+    delete r.scores[pid];
+    if (bot) pushLog(r, `${bot.name} removed from the table.`);
+    await saveRoom(code, r);
+    setRoom(r);
   }
 
   async function joinRoom() {
@@ -1282,10 +1459,9 @@ export default function App() {
 
   async function handlePlay(card) {
     if (!room) return;
-    const actingId = room.practiceMode ? room.currentTurnId : myId;
-    if (room.currentTurnId !== actingId) return;
+    if (room.currentTurnId !== myId) return;
     let r = JSON.parse(JSON.stringify(room));
-    r = playCard(r, actingId, card);
+    r = playCard(r, myId, card);
     await saveRoom(code, r);
     setRoom(r);
     setSelectedCard(null);
@@ -1453,22 +1629,6 @@ export default function App() {
                 New Table
               </button>
             </div>
-            <button
-              onClick={startSoloTest}
-              style={{
-                width: "100%",
-                marginTop: 10,
-                background: "transparent",
-                border: "none",
-                color: T.cream,
-                opacity: 0.55,
-                fontSize: 12,
-                textDecoration: "underline",
-                fontFamily: DISPLAY_FONT,
-              }}
-            >
-              Practice solo — fill seats with bots I control
-            </button>
 
             <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "18px 0" }}>
               <div style={{ flex: 1, height: 1, background: "#3a5a4c" }} />
@@ -1558,23 +1718,68 @@ export default function App() {
                     style={{
                       display: "flex",
                       alignItems: "center",
+                      justifyContent: "space-between",
                       gap: 10,
                       padding: "10px 4px",
                       borderBottom: i < room.maxPlayers - 1 ? "1px solid #234838" : "none",
                     }}
                   >
-                    <div
-                      style={{
-                        width: 8,
-                        height: 8,
-                        borderRadius: 99,
-                        background: p ? seatColor(room, p.id) : "#3a5a4c",
-                      }}
-                    />
-                    <div style={{ color: p ? T.cream : "#5f7f70", fontSize: 15, fontFamily: DISPLAY_FONT }}>
-                      {p ? p.name : "Waiting…"}
-                      {p && p.id === myId ? " (you)" : ""}
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+                      <div
+                        style={{
+                          width: 8,
+                          height: 8,
+                          borderRadius: 99,
+                          background: p ? seatColor(room, p.id) : "#3a5a4c",
+                          flexShrink: 0,
+                        }}
+                      />
+                      <div
+                        style={{
+                          color: p ? T.cream : "#5f7f70",
+                          fontSize: 15,
+                          fontFamily: DISPLAY_FONT,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                        }}
+                      >
+                        {p ? p.name : "Empty seat"}
+                        {p && p.id === myId ? " (you)" : ""}
+                        {p && p.isBot ? " 🤖" : ""}
+                      </div>
                     </div>
+                    {!p && (
+                      <button
+                        onClick={addBot}
+                        style={{
+                          fontSize: 12,
+                          color: T.brassLight,
+                          background: "transparent",
+                          border: `1px solid ${T.brassDim}`,
+                          borderRadius: 8,
+                          padding: "5px 10px",
+                          fontFamily: DISPLAY_FONT,
+                          flexShrink: 0,
+                        }}
+                      >
+                        Add Bot
+                      </button>
+                    )}
+                    {p && p.isBot && (
+                      <button
+                        onClick={() => removeBot(p.id)}
+                        style={{
+                          fontSize: 12,
+                          color: "#A3312A",
+                          background: "transparent",
+                          border: "none",
+                          flexShrink: 0,
+                        }}
+                      >
+                        Remove
+                      </button>
+                    )}
                   </div>
                 );
               })}
@@ -1615,9 +1820,9 @@ export default function App() {
 
   /* ---------------- GAME SCREEN ---------------- */
   const allPlayers = room.turnOrder;
-  const activeSeat = room.practiceMode ? room.currentTurnId : myId;
+  const activeSeat = myId;
   const myHand = room.hands?.[activeSeat] || [];
-  const isMyTurn = !room.awaitingTrickClear && (room.practiceMode ? true : room.currentTurnId === myId);
+  const isMyTurn = !room.awaitingTrickClear && room.currentTurnId === myId;
   const isForcedOpen = room.trickNumber === 1 && room.currentTrick.length === 0;
   const forcedCardForHand = isForcedOpen ? room.forcedOpenCard : null;
   const nameOf = (pid) => room.players.find((p) => p.id === pid)?.name || pid;
@@ -1666,7 +1871,7 @@ export default function App() {
           style={{ flex: 1, textAlign: "center", background: "transparent", border: "none", padding: 0 }}
         >
           <div style={{ fontSize: 10, color: T.brassLight, letterSpacing: 2, opacity: 0.8 }}>
-            ROUND {room.round} / 6{room.practiceMode ? " · PRACTICE" : ""}
+            ROUND {room.round} / 6
           </div>
           <div style={{ fontFamily: DISPLAY_FONT, fontSize: 17, color: T.cream, fontWeight: 700, textDecoration: "underline", textDecorationColor: "rgba(247,243,232,0.3)" }}>
             {ROUND_META[room.round]?.label}
@@ -1851,17 +2056,13 @@ export default function App() {
             <div style={{ fontFamily: DISPLAY_FONT, fontSize: 13, color: isMyTurn ? T.brassLight : T.cream, fontWeight: 700 }}>
               {room.awaitingTrickClear
                 ? "Trick complete…"
-                : room.practiceMode
-                ? `Playing as ${nameOf(activeSeat)}`
                 : isMyTurn
                 ? "Your turn"
                 : `Waiting on ${nameOf(room.currentTurnId)}`}
             </div>
-            {!room.practiceMode && (
-              <div style={{ fontSize: 10, color: T.cream, opacity: 0.5, marginTop: 1 }}>
-                Your tricks: {room.tricksWon?.[myId] ?? 0}
-              </div>
-            )}
+            <div style={{ fontSize: 10, color: T.cream, opacity: 0.5, marginTop: 1 }}>
+              Your tricks: {room.tricksWon?.[myId] ?? 0}
+            </div>
           </div>
           {selectedCard && (
             <button
