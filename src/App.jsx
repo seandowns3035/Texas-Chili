@@ -608,6 +608,36 @@ function KittyFlash({ event, nameOf }) {
   );
 }
 
+function RoundInfoOverlay({ round, onClose }) {
+  const meta = ROUND_META[round];
+  return (
+    <div style={overlayWrap} onClick={onClose}>
+      <div style={overlayCard} onClick={(e) => e.stopPropagation()}>
+        <div style={{ fontSize: 11, color: T.brassLight, letterSpacing: 2 }}>ROUND {round} / 6</div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 22, color: T.cream, fontWeight: 700, marginBottom: 14 }}>
+          {meta.label}
+        </div>
+        {round === 6 ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div style={{ fontSize: 13, color: T.cream, opacity: 0.75 }}>Every rule from Rounds 1–5, all at once:</div>
+            {[1, 2, 3, 4, 5].map((r) => (
+              <div key={r} style={{ fontSize: 14, color: T.cream }}>
+                <span style={{ color: T.brassLight, fontWeight: 700 }}>{ROUND_META[r].label} — </span>
+                {ROUND_META[r].detail}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 15, color: T.cream, lineHeight: 1.5 }}>{meta.detail}</div>
+        )}
+        <button onClick={onClose} style={{ ...buttonPrimary, width: "100%", marginTop: 18 }}>
+          Got it
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ShuffleOverlay() {
   const cardBack = {
     width: 58,
@@ -916,6 +946,7 @@ export default function App() {
   const [selectedCard, setSelectedCard] = useState(null);
   const [showLedger, setShowLedger] = useState(false);
   const [showCaptured, setShowCaptured] = useState(false);
+  const [showRoundInfo, setShowRoundInfo] = useState(false);
   const [kittyFlash, setKittyFlash] = useState(null);
   const [showMenu, setShowMenu] = useState(false);
   const [confirmEndTable, setConfirmEndTable] = useState(false);
@@ -1583,7 +1614,7 @@ export default function App() {
   }
 
   /* ---------------- GAME SCREEN ---------------- */
-  const opponents = room.turnOrder.filter((pid) => pid !== myId);
+  const allPlayers = room.turnOrder;
   const activeSeat = room.practiceMode ? room.currentTurnId : myId;
   const myHand = room.hands?.[activeSeat] || [];
   const isMyTurn = !room.awaitingTrickClear && (room.practiceMode ? true : room.currentTurnId === myId);
@@ -1630,14 +1661,17 @@ export default function App() {
         >
           ☰
         </button>
-        <div style={{ flex: 1, textAlign: "center" }}>
+        <button
+          onClick={() => setShowRoundInfo(true)}
+          style={{ flex: 1, textAlign: "center", background: "transparent", border: "none", padding: 0 }}
+        >
           <div style={{ fontSize: 10, color: T.brassLight, letterSpacing: 2, opacity: 0.8 }}>
             ROUND {room.round} / 6{room.practiceMode ? " · PRACTICE" : ""}
           </div>
-          <div style={{ fontFamily: DISPLAY_FONT, fontSize: 17, color: T.cream, fontWeight: 700 }}>
+          <div style={{ fontFamily: DISPLAY_FONT, fontSize: 17, color: T.cream, fontWeight: 700, textDecoration: "underline", textDecorationColor: "rgba(247,243,232,0.3)" }}>
             {ROUND_META[room.round]?.label}
           </div>
-        </div>
+        </button>
         <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
           <button
             onClick={() => setShowCaptured(true)}
@@ -1670,7 +1704,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* Opponents grid — wraps to fit anywhere from 2 to 9 opponents */}
+      {/* Player row — every seat at the table, wraps to fit 3–10 players */}
       <div
         style={{
           display: "grid",
@@ -1679,9 +1713,10 @@ export default function App() {
           gap: 6,
         }}
       >
-        {opponents.map((pid) => {
+        {allPlayers.map((pid) => {
           const handCount = room.hands?.[pid]?.length ?? 0;
           const active = room.currentTurnId === pid;
+          const isSelf = pid === myId;
           return (
             <div
               key={pid}
@@ -1710,6 +1745,7 @@ export default function App() {
               >
                 <ColorDot color={seatColor(room, pid)} />
                 {nameOf(pid)}
+                {isSelf ? " (you)" : ""}
               </div>
               <div style={{ fontSize: 10, color: T.cream, opacity: 0.55, marginTop: 1 }}>
                 {handCount} cards · {room.tricksWon?.[pid] ?? 0} tricks
@@ -1724,10 +1760,10 @@ export default function App() {
         style={{
           flex: 1,
           display: "flex",
+          flexDirection: "column",
           alignItems: "center",
           justifyContent: "center",
           padding: "10px 16px",
-          position: "relative",
         }}
       >
         <div
@@ -1783,14 +1819,12 @@ export default function App() {
         {room.leadSuit && (
           <div
             style={{
-              position: "absolute",
-              top: 2,
-              left: "50%",
-              transform: "translateX(-50%)",
+              textAlign: "center",
               fontSize: 10,
               color: T.cream,
               opacity: 0.5,
               letterSpacing: 1,
+              marginTop: 10,
             }}
           >
             LEADING SUIT: {SUIT_SYMBOL[room.leadSuit]} {SUIT_NAME[room.leadSuit]}
@@ -1881,6 +1915,8 @@ export default function App() {
       {kittyFlash && <KittyFlash event={kittyFlash} nameOf={nameOf} />}
 
       {shuffleAnim && <ShuffleOverlay />}
+
+      {showRoundInfo && <RoundInfoOverlay round={room.round} onClose={() => setShowRoundInfo(false)} />}
 
       {showMenu && (
         <GameMenu
