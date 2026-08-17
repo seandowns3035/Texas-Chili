@@ -164,16 +164,18 @@ function findForcedOpener(hands, turnOrder) {
   return { playerId: turnOrder[0], card: null };
 }
 
-function computeRoundPoints(round, tricksWon, capturedCards) {
+function computeRoundPoints(round, tricksWon, capturedCards, pid, lastTrickWinner) {
   let pts = 0;
   const wantsTricks = round === 1 || round === 6;
   const wantsQueens = round === 2 || round === 6;
   const wantsHearts = round === 3 || round === 6;
   const wantsKingSpades = round === 4 || round === 6;
+  const wantsLastTrick = round === 5 || round === 6;
   if (wantsTricks) pts += tricksWon * 10;
   if (wantsQueens) pts += capturedCards.filter((c) => c.rank === "Q").length * 25;
   if (wantsHearts) pts += capturedCards.filter((c) => c.suit === "H").length * 10;
   if (wantsKingSpades && capturedCards.some((c) => c.rank === "K" && c.suit === "S")) pts += 100;
+  if (wantsLastTrick && pid === lastTrickWinner) pts += 100;
   return pts;
 }
 
@@ -246,6 +248,7 @@ function clearSession() {
    game state, so these live in localStorage rather than the room. */
 const CHIME_PREF_KEY = "texasChiliChimeEnabled";
 const FLASH_PREF_KEY = "texasChiliFlashEnabled";
+const DOUBLE_TAP_PREF_KEY = "texasChiliDoubleTapEnabled";
 function loadBoolPref(key, fallback) {
   try {
     const raw = localStorage.getItem(key);
@@ -436,7 +439,7 @@ function resolveTrickAfterPause(room) {
     // Score the round
     const breakdown = {};
     room.turnOrder.forEach((pid) => {
-      const pts = computeRoundPoints(room.round, room.tricksWon[pid] || 0, room.capturedCards[pid] || []);
+      const pts = computeRoundPoints(room.round, room.tricksWon[pid] || 0, room.capturedCards[pid] || [], pid, room.lastTrickWinner);
       breakdown[pid] = pts;
       room.scores[pid] = room.scores[pid] || {};
       room.scores[pid][room.round] = pts;
@@ -605,6 +608,52 @@ function KittyFlash({ event, nameOf }) {
   );
 }
 
+function ShuffleOverlay() {
+  const cardBack = {
+    width: 58,
+    height: 82,
+    borderRadius: 8,
+    background: `repeating-linear-gradient(45deg, ${T.feltDark}, ${T.feltDark} 4px, ${T.brassDim} 4px, ${T.brassDim} 5px)`,
+    border: `1.5px solid ${T.brassDim}`,
+    boxShadow: "0 4px 10px rgba(0,0,0,0.5)",
+    position: "absolute",
+    inset: 0,
+  };
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 72,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        pointerEvents: "none",
+      }}
+    >
+      <div style={{ position: "relative", width: 58, height: 82 }}>
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div key={i} style={{ ...cardBack, animation: `shuffleCard 1.1s ease-in-out ${i * 0.06}s both` }} />
+        ))}
+      </div>
+      <div style={{ fontFamily: DISPLAY_FONT, fontSize: 12, color: T.brassLight, opacity: 0.8, marginTop: 16, letterSpacing: 1 }}>
+        Shuffling…
+      </div>
+      <style>{`
+        @keyframes shuffleCard {
+          0% { transform: translateX(0) rotate(0deg); opacity: 0; }
+          15% { opacity: 1; }
+          35% { transform: translateX(-26px) rotate(-14deg); }
+          65% { transform: translateX(26px) rotate(14deg); }
+          85% { opacity: 1; }
+          100% { transform: translateX(0) rotate(0deg); opacity: 0; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
 function CapturedView({ room, myId, nameOf, onClose }) {
   return (
     <div
@@ -612,7 +661,7 @@ function CapturedView({ room, myId, nameOf, onClose }) {
         position: "fixed",
         inset: 0,
         background: "rgba(0,0,0,0.6)",
-        zIndex: 50,
+        zIndex: 65,
         display: "flex",
         alignItems: "flex-end",
       }}
@@ -697,13 +746,25 @@ function CapturedView({ room, myId, nameOf, onClose }) {
   );
 }
 
-function Ledger({ room, myId, onClose }) {
+function Ledger({ room, myId, onClose, onEditScore }) {
+  const [editMode, setEditMode] = useState(false);
   const rounds = [1, 2, 3, 4, 5, 6];
   const totals = {};
   room.turnOrder.forEach((pid) => {
     totals[pid] = rounds.reduce((sum, r) => sum + ((room.scores[pid] || {})[r] || 0), 0);
   });
   const lowest = Math.min(...Object.values(totals));
+
+  function handleCellTap(pid, r) {
+    if (!editMode || !onEditScore) return;
+    const playerName = room.players.find((p) => p.id === pid)?.name || pid;
+    const current = (room.scores[pid] || {})[r] ?? 0;
+    const input = window.prompt(`Correct ${playerName}'s Round ${r} score:`, String(current));
+    if (input === null) return;
+    const value = Number(input);
+    if (Number.isNaN(value)) return;
+    onEditScore(pid, r, Math.round(value));
+  }
 
   return (
     <div
@@ -731,10 +792,32 @@ function Ledger({ room, myId, onClose }) {
       >
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
           <div style={{ fontFamily: DISPLAY_FONT, fontSize: 20, fontWeight: 700, color: T.ink }}>Ledger</div>
-          <button onClick={onClose} className="text-sm" style={{ color: T.ink, opacity: 0.6 }}>
-            Close
-          </button>
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            {onEditScore && (
+              <button
+                onClick={() => setEditMode((v) => !v)}
+                style={{
+                  fontSize: 12,
+                  color: editMode ? "#A3312A" : T.ink,
+                  opacity: editMode ? 1 : 0.6,
+                  fontWeight: editMode ? 700 : 400,
+                  background: "transparent",
+                  border: "none",
+                }}
+              >
+                {editMode ? "Done Editing" : "Edit Scores"}
+              </button>
+            )}
+            <button onClick={onClose} className="text-sm" style={{ color: T.ink, opacity: 0.6 }}>
+              Close
+            </button>
+          </div>
         </div>
+        {editMode && (
+          <div style={{ fontSize: 11, color: "#A3312A", opacity: 0.85, marginBottom: 10 }}>
+            Tap any score below to correct it.
+          </div>
+        )}
         <div style={{ overflowX: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: DISPLAY_FONT }}>
             <thead>
@@ -774,13 +857,16 @@ function Ledger({ room, myId, onClose }) {
                   {room.turnOrder.map((pid) => (
                     <td
                       key={pid}
+                      onClick={() => handleCellTap(pid, r)}
                       style={{
                         textAlign: "right",
                         padding: "6px 8px",
                         fontVariantNumeric: "tabular-nums",
                         fontSize: 14,
-                        color: T.ink,
+                        color: editMode ? "#A3312A" : T.ink,
                         borderBottom: "1px solid #ddd3ba",
+                        textDecoration: editMode ? "underline" : "none",
+                        cursor: editMode ? "pointer" : "default",
                       }}
                     >
                       {(room.scores[pid] || {})[r] ?? "–"}
@@ -842,6 +928,10 @@ export default function App() {
   const [codeCopied, setCodeCopied] = useState(false);
   const [chimeEnabled, setChimeEnabled] = useState(() => loadBoolPref(CHIME_PREF_KEY, true));
   const [flashEnabled, setFlashEnabled] = useState(() => loadBoolPref(FLASH_PREF_KEY, true));
+  const [doubleTapEnabled, setDoubleTapEnabled] = useState(() => loadBoolPref(DOUBLE_TAP_PREF_KEY, false));
+  const lastTapRef = useRef(null);
+  const [shuffleAnim, setShuffleAnim] = useState(false);
+  const prevStatusRef = useRef(undefined);
 
   function toggleChime() {
     setChimeEnabled((prev) => {
@@ -854,6 +944,13 @@ export default function App() {
     setFlashEnabled((prev) => {
       const next = !prev;
       saveBoolPref(FLASH_PREF_KEY, next);
+      return next;
+    });
+  }
+  function toggleDoubleTap() {
+    setDoubleTapEnabled((prev) => {
+      const next = !prev;
+      saveBoolPref(DOUBLE_TAP_PREF_KEY, next);
       return next;
     });
   }
@@ -1005,6 +1102,23 @@ export default function App() {
     return () => clearTimeout(t);
   }, [room?.awaitingTrickClear, code]);
 
+  // Shuffle animation: plays a brief cosmetic overlay whenever a round
+  // actually starts dealing (status transitions into "playing"). The ref
+  // starts undefined so the very first time this device observes the room
+  // — including reconnecting mid-round — just records a baseline instead
+  // of animating; only a real transition afterward triggers the flourish.
+  useEffect(() => {
+    if (!room) return;
+    const prevStatus = prevStatusRef.current;
+    prevStatusRef.current = room.status;
+    if (prevStatus === undefined) return;
+    if (prevStatus !== "playing" && room.status === "playing") {
+      setShuffleAnim(true);
+      const t = setTimeout(() => setShuffleAnim(false), 1300);
+      return () => clearTimeout(t);
+    }
+  }, [room?.status]);
+
   // Turn alert: a brief flash + chime the moment a new turn actually starts
   // (not every render while it's still the same person's turn). Fires when
   // room.currentTurnId changes to a value we should alert on — for real
@@ -1146,10 +1260,46 @@ export default function App() {
     setSelectedCard(null);
   }
 
+  // Handles a tap on a card in hand.
+  // Normal mode: tap selects/deselects, a separate Play button confirms.
+  // Double-Tap to Play mode: a single tap does nothing visible — only a
+  // fast second tap on the same card (within 350ms) selects and plays it
+  // in one motion. This fully replaces the select step in that mode.
+  function handleCardTap(c) {
+    const id = cardId(c);
+    if (doubleTapEnabled) {
+      const last = lastTapRef.current;
+      const now = Date.now();
+      if (last && last.id === id && now - last.time < 350) {
+        lastTapRef.current = null;
+        handlePlay(c);
+      } else {
+        lastTapRef.current = { id, time: now };
+      }
+      return;
+    }
+    setSelectedCard((prev) => (prev && prev.rank === c.rank && prev.suit === c.suit ? null : c));
+  }
+
   async function continueToNextRound() {
     if (!room) return;
     let r = JSON.parse(JSON.stringify(room));
     r = startRound(r, room.round + 1);
+    await saveRoom(code, r);
+    setRoom(r);
+  }
+
+  // Manual score correction — for when the automated scoring gets
+  // something wrong and needs a human fix. Logged for transparency so
+  // everyone can see a correction happened.
+  async function editScore(pid, round, newValue) {
+    if (!room) return;
+    let r = JSON.parse(JSON.stringify(room));
+    r.scores[pid] = r.scores[pid] || {};
+    const editorName = r.players.find((p) => p.id === myId)?.name || myId;
+    const targetName = r.players.find((p) => p.id === pid)?.name || pid;
+    pushLog(r, `${editorName} corrected ${targetName}'s Round ${round} score to ${newValue}.`);
+    r.scores[pid][round] = newValue;
     await saveRoom(code, r);
     setRoom(r);
   }
@@ -1662,15 +1812,22 @@ export default function App() {
           paddingBottom: "max(18px, env(safe-area-inset-bottom))",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 8px" }}>
-          <div style={{ fontFamily: DISPLAY_FONT, fontSize: 13, color: isMyTurn ? T.brassLight : T.cream, fontWeight: 700 }}>
-            {room.awaitingTrickClear
-              ? "Trick complete…"
-              : room.practiceMode
-              ? `Playing as ${nameOf(activeSeat)}`
-              : isMyTurn
-              ? "Your turn"
-              : `Waiting on ${nameOf(room.currentTurnId)}`}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 4px" }}>
+          <div>
+            <div style={{ fontFamily: DISPLAY_FONT, fontSize: 13, color: isMyTurn ? T.brassLight : T.cream, fontWeight: 700 }}>
+              {room.awaitingTrickClear
+                ? "Trick complete…"
+                : room.practiceMode
+                ? `Playing as ${nameOf(activeSeat)}`
+                : isMyTurn
+                ? "Your turn"
+                : `Waiting on ${nameOf(room.currentTurnId)}`}
+            </div>
+            {!room.practiceMode && (
+              <div style={{ fontSize: 10, color: T.cream, opacity: 0.5, marginTop: 1 }}>
+                Your tricks: {room.tricksWon?.[myId] ?? 0}
+              </div>
+            )}
           </div>
           {selectedCard && (
             <button
@@ -1703,7 +1860,7 @@ export default function App() {
                   selected={isSelected}
                   onClick={
                     legal
-                      ? () => setSelectedCard(isSelected ? null : c)
+                      ? () => handleCardTap(c)
                       : undefined
                   }
                 />
@@ -1713,13 +1870,17 @@ export default function App() {
         </div>
       </div>
 
-      {showLedger && <Ledger room={room} myId={myId} onClose={() => setShowLedger(false)} />}
+      {showLedger && (
+        <Ledger room={room} myId={myId} onClose={() => setShowLedger(false)} onEditScore={editScore} />
+      )}
 
       {showCaptured && (
         <CapturedView room={room} myId={myId} nameOf={nameOf} onClose={() => setShowCaptured(false)} />
       )}
 
       {kittyFlash && <KittyFlash event={kittyFlash} nameOf={nameOf} />}
+
+      {shuffleAnim && <ShuffleOverlay />}
 
       {showMenu && (
         <GameMenu
@@ -1728,8 +1889,10 @@ export default function App() {
           onCopyCode={copyRoomCode}
           chimeEnabled={chimeEnabled}
           flashEnabled={flashEnabled}
+          doubleTapEnabled={doubleTapEnabled}
           onToggleChime={toggleChime}
           onToggleFlash={toggleFlash}
+          onToggleDoubleTap={toggleDoubleTap}
           onLeave={leaveToMenu}
           onRequestEndTable={() => {
             setShowMenu(false);
@@ -1750,16 +1913,40 @@ export default function App() {
       )}
 
       {room.status === "round-end" && (
-        <RoundEndOverlay room={room} nameOf={nameOf} onContinue={continueToNextRound} />
+        <RoundEndOverlay
+          room={room}
+          nameOf={nameOf}
+          onContinue={continueToNextRound}
+          onOpenCaptured={() => setShowCaptured(true)}
+        />
       )}
       {room.status === "game-end" && (
-        <GameEndOverlay room={room} nameOf={nameOf} onLeave={leaveToMenu} onOpenLedger={() => setShowLedger(true)} />
+        <GameEndOverlay
+          room={room}
+          nameOf={nameOf}
+          onLeave={leaveToMenu}
+          onOpenLedger={() => setShowLedger(true)}
+          onOpenCaptured={() => setShowCaptured(true)}
+        />
       )}
     </div>
   );
 }
 
-function GameMenu({ code, codeCopied, onCopyCode, chimeEnabled, flashEnabled, onToggleChime, onToggleFlash, onLeave, onRequestEndTable, onClose }) {
+function GameMenu({
+  code,
+  codeCopied,
+  onCopyCode,
+  chimeEnabled,
+  flashEnabled,
+  doubleTapEnabled,
+  onToggleChime,
+  onToggleFlash,
+  onToggleDoubleTap,
+  onLeave,
+  onRequestEndTable,
+  onClose,
+}) {
   return (
     <div
       style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 55, display: "flex", alignItems: "flex-end" }}
@@ -1798,6 +1985,13 @@ function GameMenu({ code, codeCopied, onCopyCode, chimeEnabled, flashEnabled, on
           <Toggle checked={chimeEnabled} onChange={onToggleChime} label="Turn Chime" />
           <div style={{ borderTop: "1px solid #ece5d2" }} />
           <Toggle checked={flashEnabled} onChange={onToggleFlash} label="Turn Flash" />
+          <div style={{ borderTop: "1px solid #ece5d2" }} />
+          <Toggle checked={doubleTapEnabled} onChange={onToggleDoubleTap} label="Double-Tap to Play" />
+          {doubleTapEnabled && (
+            <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, padding: "0 2px 10px" }}>
+              A single tap won't select a card — double-tap it to play instantly.
+            </div>
+          )}
         </div>
 
         <button
@@ -1845,7 +2039,7 @@ function ConfirmDialog({ title, body, confirmLabel, onConfirm, onCancel }) {
   );
 }
 
-function RoundEndOverlay({ room, nameOf, onContinue }) {
+function RoundEndOverlay({ room, nameOf, onContinue, onOpenCaptured }) {
   const info = room.roundEndInfo;
   if (!info) return null;
   const entries = room.turnOrder.map((pid) => ({ pid, pts: info.breakdown[pid] || 0 }));
@@ -1868,7 +2062,12 @@ function RoundEndOverlay({ room, nameOf, onContinue }) {
             <span style={{ color: T.brassLight, fontSize: 14, fontVariantNumeric: "tabular-nums" }}>+{e.pts}</span>
           </div>
         ))}
-        <button onClick={onContinue} style={{ ...buttonPrimary, width: "100%", marginTop: 18 }}>
+        {onOpenCaptured && (
+          <button onClick={onOpenCaptured} style={{ ...buttonSecondary, width: "100%", marginTop: 16 }}>
+            View Captured Cards
+          </button>
+        )}
+        <button onClick={onContinue} style={{ ...buttonPrimary, width: "100%", marginTop: 10 }}>
           {info.round >= 6 ? "See Final Results" : `Deal Round ${info.round + 1}`}
         </button>
       </div>
@@ -1916,7 +2115,7 @@ function Confetti() {
   );
 }
 
-function GameEndOverlay({ room, nameOf, onLeave, onOpenLedger }) {
+function GameEndOverlay({ room, nameOf, onLeave, onOpenLedger, onOpenCaptured }) {
   const totals = room.turnOrder.map((pid) => ({
     pid,
     total: [1, 2, 3, 4, 5, 6].reduce((s, r) => s + ((room.scores[pid] || {})[r] || 0), 0),
@@ -1946,8 +2145,13 @@ function GameEndOverlay({ room, nameOf, onLeave, onOpenLedger }) {
           <div style={{ fontSize: 11, color: T.cream, opacity: 0.5, marginTop: 14, textAlign: "center" }}>
             Lowest total wins. Start a new table to play again.
           </div>
+          {onOpenCaptured && (
+            <button onClick={onOpenCaptured} style={{ ...buttonSecondary, width: "100%", marginTop: 16 }}>
+              View Captured Cards
+            </button>
+          )}
           {onOpenLedger && (
-            <button onClick={onOpenLedger} style={{ ...buttonSecondary, width: "100%", marginTop: 16 }}>
+            <button onClick={onOpenLedger} style={{ ...buttonSecondary, width: "100%", marginTop: 10 }}>
               View Full Ledger
             </button>
           )}
