@@ -802,7 +802,35 @@ function RoundInfoOverlay({ round, onClose }) {
   );
 }
 
-function ShuffleOverlay() {
+const SHUFFLE_PHASE_MS = 720;
+const DEAL_PHASE_MS = 900;
+
+/* Owns its own lifecycle: phase switching, both sound effects, and calling
+   onDone when finished. Keeping the sequencing here rather than in the
+   parent effect means a re-render or a StrictMode double-mount can't strand
+   the overlay on screen or silently swallow the deal sound. */
+function ShuffleOverlay({ onDone, soundEnabled, playShuffle, playDeal }) {
+  const [phase, setPhase] = useState("shuffle");
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (!startedRef.current) {
+      startedRef.current = true;
+      if (soundEnabled) playShuffle();
+    }
+    const toDeal = setTimeout(() => {
+      setPhase("deal");
+      if (soundEnabled) playDeal();
+    }, SHUFFLE_PHASE_MS);
+    const finish = setTimeout(() => {
+      if (onDone) onDone();
+    }, SHUFFLE_PHASE_MS + DEAL_PHASE_MS);
+    return () => {
+      clearTimeout(toDeal);
+      clearTimeout(finish);
+    };
+  }, []);
+
   const cardBack = {
     width: 42,
     height: 60,
@@ -816,10 +844,10 @@ function ShuffleOverlay() {
   // Four upward-angled streams — a stylized deal rather than tracking every
   // actual player position, which stays reliable at any table size (3-10).
   const directions = [
-    { dx: -150, dy: -240, rot: -22 },
-    { dx: -55, dy: -280, rot: -8 },
-    { dx: 55, dy: -280, rot: 8 },
-    { dx: 150, dy: -240, rot: 22 },
+    { dx: -150, dy: -230, rot: -22 },
+    { dx: -55, dy: -270, rot: -8 },
+    { dx: 55, dy: -270, rot: 8 },
+    { dx: 150, dy: -230, rot: 22 },
   ];
   const [pieces] = useState(() =>
     directions.flatMap((dir, dIdx) =>
@@ -828,10 +856,22 @@ function ShuffleOverlay() {
         dx: dir.dx + (Math.random() * 14 - 7),
         dy: dir.dy + (Math.random() * 14 - 7),
         rot: dir.rot + (Math.random() * 10 - 5),
-        delay: dIdx * 0.07 + i * 0.09,
+        delay: dIdx * 0.05 + i * 0.06,
       }))
     )
   );
+  // Each riffle card fans a different distance and direction — stacking
+  // them with identical motion just reads as one card wobbling.
+  const riffleCards = [0, 1, 2, 3, 4, 5].map((i) => {
+    const dir = i % 2 === 0 ? -1 : 1;
+    return {
+      id: i,
+      sx: dir * (18 + i * 6),
+      sr: dir * (7 + i * 3),
+      delay: i * 0.035,
+    };
+  });
+
   return (
     <div
       style={{
@@ -846,28 +886,55 @@ function ShuffleOverlay() {
       }}
     >
       <div style={{ position: "relative", width: 42, height: 60 }}>
-        <div style={cardBack} />
-        {pieces.map((p) => (
-          <div
-            key={p.id}
-            style={{
-              ...cardBack,
-              "--dx": `${p.dx}px`,
-              "--dy": `${p.dy}px`,
-              "--rot": `${p.rot}deg`,
-              animation: `dealCard 0.85s cubic-bezier(0.16,0.8,0.3,1) ${p.delay}s both`,
-            }}
-          />
-        ))}
+        {phase === "shuffle" ? (
+          <>
+            <div style={cardBack} />
+            {riffleCards.map((c) => (
+              <div
+                key={`s${c.id}`}
+                style={{
+                  ...cardBack,
+                  "--sx": `${c.sx}px`,
+                  "--sr": `${c.sr}deg`,
+                  animation: `riffleCard 0.18s ease-in-out ${c.delay}s 4 alternate both`,
+                }}
+              />
+            ))}
+          </>
+        ) : (
+          <>
+            <div style={{ ...cardBack, animation: "deckFade 0.45s ease-out 0.25s both" }} />
+            {pieces.map((p) => (
+              <div
+                key={p.id}
+                style={{
+                  ...cardBack,
+                  "--dx": `${p.dx}px`,
+                  "--dy": `${p.dy}px`,
+                  "--rot": `${p.rot}deg`,
+                  animation: `dealCard 0.6s cubic-bezier(0.16,0.8,0.3,1) ${p.delay}s both`,
+                }}
+              />
+            ))}
+          </>
+        )}
       </div>
       <div style={{ fontFamily: DISPLAY_FONT, fontSize: 12, color: T.brassLight, opacity: 0.8, marginTop: 18, letterSpacing: 1 }}>
-        Dealing…
+        {phase === "shuffle" ? "Shuffling…" : "Dealing…"}
       </div>
       <style>{`
+        @keyframes riffleCard {
+          0% { transform: translateX(0) rotate(0deg); }
+          100% { transform: translateX(var(--sx)) rotate(var(--sr)); }
+        }
         @keyframes dealCard {
           0% { transform: translate(0, 0) rotate(0deg); opacity: 0; }
-          10% { opacity: 1; }
+          12% { opacity: 1; }
           100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)); opacity: 0; }
+        }
+        @keyframes deckFade {
+          0% { opacity: 1; }
+          100% { opacity: 0; }
         }
       `}</style>
     </div>
@@ -1242,7 +1309,7 @@ export default function App() {
     try {
       const ctx = audioCtxRef.current;
       if (!ctx) return;
-      const duration = 0.85;
+      const duration = 0.7;
       const bufferSize = Math.floor(ctx.sampleRate * duration);
       const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
       const data = buffer.getChannelData(0);
@@ -1262,6 +1329,46 @@ export default function App() {
       filter.frequency.value = 1200;
       const gain = ctx.createGain();
       gain.gain.value = 0.3;
+      source.connect(filter);
+      filter.connect(gain);
+      gain.connect(ctx.destination);
+      source.start();
+    } catch (e) {
+      /* ignore */
+    }
+  }
+  // The deal: a handful of separated "schik" swooshes rather than the
+  // riffle's rapid clicks. Each burst is longer and uses a rise-and-fall
+  // envelope (so it swooshes instead of clicking), bandpassed to give it
+  // the papery character of a card sliding off the deck.
+  function playDealSound() {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const duration = 0.95;
+      const bufferSize = Math.floor(ctx.sampleRate * duration);
+      const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      const burstCount = 4;
+      const gap = Math.floor(ctx.sampleRate * 0.19);
+      const len = Math.floor(ctx.sampleRate * 0.1);
+      for (let b = 0; b < burstCount; b++) {
+        const start = b * gap;
+        for (let i = 0; i < len && start + i < bufferSize; i++) {
+          const t = i / len;
+          // Fast attack, slower tail — a "schhk" swoosh shape.
+          const envelope = Math.sin(Math.PI * Math.pow(t, 0.55));
+          data[start + i] = (Math.random() * 2 - 1) * envelope * 0.55;
+        }
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const filter = ctx.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.frequency.value = 2300;
+      filter.Q.value = 0.8;
+      const gain = ctx.createGain();
+      gain.gain.value = 0.42;
       source.connect(filter);
       filter.connect(gain);
       gain.connect(ctx.destination);
@@ -1391,12 +1498,11 @@ export default function App() {
     prevStatusRef.current = room.status;
     if (prevStatus === undefined) return;
     if (prevStatus !== "playing" && room.status === "playing") {
+      // The overlay handles its own phases, sounds, and teardown — this
+      // just switches it on.
       setShuffleAnim(true);
-      if (chimeEnabled) playShuffleSound();
-      const t = setTimeout(() => setShuffleAnim(false), 1300);
-      return () => clearTimeout(t);
     }
-  }, [room?.status, chimeEnabled]);
+  }, [room?.status]);
 
   // Turn alert: a brief flash + chime the moment a new turn actually starts
   // (not every render while it's still the same person's turn). Fires when
@@ -2176,7 +2282,14 @@ export default function App() {
 
       {kittyFlash && <KittyFlash event={kittyFlash} nameOf={nameOf} />}
 
-      {shuffleAnim && <ShuffleOverlay />}
+      {shuffleAnim && (
+        <ShuffleOverlay
+          soundEnabled={chimeEnabled}
+          playShuffle={playShuffleSound}
+          playDeal={playDealSound}
+          onDone={() => setShuffleAnim(false)}
+        />
+      )}
 
       {showRoundInfo && <RoundInfoOverlay round={room.round} onClose={() => setShowRoundInfo(false)} />}
 
