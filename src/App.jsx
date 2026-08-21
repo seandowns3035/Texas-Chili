@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { db } from "./firebase.js";
 import { ref, set, get, remove, onValue } from "firebase/database";
 
@@ -17,6 +17,7 @@ const T = {
   panel: "#0E3B2C",
   active: "#2F6B4F",
 };
+const APP_VERSION = "v1.9-intro";
 const DISPLAY_FONT = '"Iowan Old Style", "Palatino Linotype", Georgia, serif';
 
 /* Fixed per-seat colors (by position in turnOrder, not by name) so every
@@ -1220,6 +1221,7 @@ export default function App() {
   const lastTapRef = useRef(null);
   const [shuffleAnim, setShuffleAnim] = useState(false);
   const prevStatusRef = useRef(undefined);
+  const shuffleActiveRef = useRef(false);
 
   function toggleChime() {
     setChimeEnabled((prev) => {
@@ -1492,31 +1494,41 @@ export default function App() {
   // starts undefined so the very first time this device observes the room
   // — including reconnecting mid-round — just records a baseline instead
   // of animating; only a real transition afterward triggers the flourish.
-  useEffect(() => {
+  // useLayoutEffect, not useEffect: this must run before the browser
+  // paints. With a normal effect the newly dealt hand gets painted at full
+  // opacity for one frame before the hide applies, which reads as the hand
+  // flashing into view and then fading out again.
+  useLayoutEffect(() => {
     if (!room) return;
     const prevStatus = prevStatusRef.current;
     prevStatusRef.current = room.status;
     if (prevStatus === undefined) return;
     if (prevStatus !== "playing" && room.status === "playing") {
       // The overlay handles its own phases, sounds, and teardown — this
-      // just switches it on.
+      // just switches it on. The ref is set synchronously so the turn-alert
+      // effect below (running in this same commit, where the shuffleAnim
+      // state is still false) knows to hold its chime until the deal lands.
+      shuffleActiveRef.current = true;
       setShuffleAnim(true);
     }
   }, [room?.status]);
 
   // Turn alert: a brief flash + chime the moment a new turn actually starts
   // (not every render while it's still the same person's turn). Fires when
-  // room.currentTurnId changes to a value we should alert on — for real
-  // play that's whenever it becomes myId; for Practice Mode (where you're
-  // playing every seat) that's every single turn boundary, since each one
-  // is a new decision for you to make. Real vibration isn't available —
-  // iOS Safari has never supported navigator.vibrate(), even as an
-  // installed home-screen app — so this is the reliable stand-in.
+  // room.currentTurnId changes to a value we should alert on. Real vibration
+  // isn't available — iOS Safari has never supported navigator.vibrate(),
+  // even as an installed home-screen app — so this is the reliable stand-in.
   useEffect(() => {
     if (!room || room.status !== "playing") {
       prevTurnIdRef.current = null;
       return;
     }
+    // Hold the alert while the shuffle/deal intro is playing. Returning
+    // before prevTurnIdRef updates means this same turn still registers as
+    // "new" once shuffleAnim flips false and re-runs this effect, so the
+    // chime lands together with the hand appearing.
+    if (shuffleActiveRef.current) return;
+
     const turnChanged = room.currentTurnId !== prevTurnIdRef.current;
     prevTurnIdRef.current = room.currentTurnId;
     if (!turnChanged) return;
@@ -1530,7 +1542,7 @@ export default function App() {
       const t = setTimeout(() => setTurnFlash(false), 900);
       return () => clearTimeout(t);
     }
-  }, [room?.currentTurnId, room?.status, myId, chimeEnabled, flashEnabled]);
+  }, [room?.currentTurnId, room?.status, myId, chimeEnabled, flashEnabled, shuffleAnim]);
 
   async function createRoom() {
     primeAudio();
@@ -2136,6 +2148,8 @@ export default function App() {
           alignItems: "center",
           justifyContent: "center",
           padding: "10px 16px",
+          opacity: shuffleAnim ? 0 : 1,
+          transition: shuffleAnim ? "none" : "opacity 340ms ease",
         }}
       >
         <div
@@ -2218,7 +2232,16 @@ export default function App() {
           paddingBottom: "max(18px, env(safe-area-inset-bottom))",
         }}
       >
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 4px" }}>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            padding: "0 6px 4px",
+            opacity: shuffleAnim ? 0 : 1,
+            transition: shuffleAnim ? "none" : "opacity 300ms ease",
+          }}
+        >
           <div>
             <div style={{ fontFamily: DISPLAY_FONT, fontSize: 13, color: isMyTurn ? T.brassLight : T.cream, fontWeight: 700 }}>
               {room.awaitingTrickClear
@@ -2247,6 +2270,9 @@ export default function App() {
             flexWrap: "wrap",
             gap: 6,
             paddingBottom: 4,
+            opacity: shuffleAnim ? 0 : 1,
+            transform: shuffleAnim ? "translateY(12px)" : "translateY(0)",
+            transition: shuffleAnim ? "none" : "opacity 340ms ease, transform 340ms ease",
           }}
         >
           {myHand.map((c, i) => {
@@ -2287,7 +2313,10 @@ export default function App() {
           soundEnabled={chimeEnabled}
           playShuffle={playShuffleSound}
           playDeal={playDealSound}
-          onDone={() => setShuffleAnim(false)}
+          onDone={() => {
+            shuffleActiveRef.current = false;
+            setShuffleAnim(false);
+          }}
         />
       )}
 
@@ -2426,6 +2455,9 @@ function GameMenu({
         >
           Cancel
         </button>
+        <div style={{ textAlign: "center", fontSize: 10, color: T.ink, opacity: 0.35, marginTop: 6 }}>
+          {APP_VERSION}
+        </div>
       </div>
     </div>
   );
