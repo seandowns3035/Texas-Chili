@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { db } from "./firebase.js";
 import { ref, set, get, remove, onValue } from "firebase/database";
 
@@ -1493,7 +1493,11 @@ export default function App() {
   // starts undefined so the very first time this device observes the room
   // — including reconnecting mid-round — just records a baseline instead
   // of animating; only a real transition afterward triggers the flourish.
-  useEffect(() => {
+  // useLayoutEffect, not useEffect: this must run before the browser
+  // paints. With a normal effect the newly dealt hand gets painted at full
+  // opacity for one frame before the hide applies, which reads as the hand
+  // flashing into view and then fading out again.
+  useLayoutEffect(() => {
     if (!room) return;
     const prevStatus = prevStatusRef.current;
     prevStatusRef.current = room.status;
@@ -2144,7 +2148,7 @@ export default function App() {
           justifyContent: "center",
           padding: "10px 16px",
           opacity: shuffleAnim ? 0 : 1,
-          transition: "opacity 340ms ease",
+          transition: shuffleAnim ? "none" : "opacity 340ms ease",
         }}
       >
         <div
@@ -2234,7 +2238,7 @@ export default function App() {
             alignItems: "center",
             padding: "0 6px 4px",
             opacity: shuffleAnim ? 0 : 1,
-            transition: "opacity 300ms ease",
+            transition: shuffleAnim ? "none" : "opacity 300ms ease",
           }}
         >
           <div>
@@ -2267,7 +2271,7 @@ export default function App() {
             paddingBottom: 4,
             opacity: shuffleAnim ? 0 : 1,
             transform: shuffleAnim ? "translateY(12px)" : "translateY(0)",
-            transition: "opacity 340ms ease, transform 340ms ease",
+            transition: shuffleAnim ? "none" : "opacity 340ms ease, transform 340ms ease",
           }}
         >
           {myHand.map((c, i) => {
