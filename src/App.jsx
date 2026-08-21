@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { db } from "./firebase.js";
-import { ref, set, get, remove, onValue } from "firebase/database";
+import { ref, set, get, remove, onValue, runTransaction } from "firebase/database";
 
 /* ============================== THEME ============================== */
 const T = {
@@ -17,7 +17,11 @@ const T = {
   panel: "#0E3B2C",
   active: "#2F6B4F",
 };
-const APP_VERSION = "v1.9-intro";
+const APP_VERSION = "v2.1-tap";
+// How long after a first tap a second tap still counts as a double tap.
+// The first-tap highlight lasts exactly this long, so the glow doubles as
+// a visible countdown of the window remaining.
+const DOUBLE_TAP_MS = 350;
 const DISPLAY_FONT = '"Iowan Old Style", "Palatino Linotype", Georgia, serif';
 
 /* Fixed per-seat colors (by position in turnOrder, not by name) so every
@@ -290,6 +294,35 @@ async function saveRoom(code, room) {
     console.error("save failed", e);
   }
   return room;
+}
+
+/* Applies a change against the room's LIVE server state inside a Firebase
+   transaction, rather than overwriting the whole node from a local snapshot.
+
+   This matters because several things write concurrently — every connected
+   client schedules the trick resolver and bot moves, and players can act at
+   nearly the same moment. A plain set() built from a snapshot that's even a
+   few hundred milliseconds stale silently erases whatever landed in between,
+   which showed up in play as a trick "rewinding" to an earlier player.
+
+   The mutator receives the current server state and returns the new state,
+   or undefined to abort (Firebase then leaves the node untouched). Because
+   the mutator re-derives everything from live data, a late or duplicated
+   call is harmless: it simply sees the work is already done and aborts. */
+async function mutateRoom(code, mutator) {
+  try {
+    const result = await runTransaction(roomRef(code), (current) => {
+      // Must return undefined, not null: Firebase treats a null return as
+      // "write null here", which would delete the room node. undefined aborts.
+      if (!current) return undefined; // room gone (ended/expired)
+      const next = mutator(hydrateRoom(current));
+      return next === undefined ? undefined : next;
+    });
+    return result.committed && result.snapshot.exists() ? hydrateRoom(result.snapshot.val()) : null;
+  } catch (e) {
+    console.error("transaction failed", e);
+    return null;
+  }
 }
 async function deleteRoom(code) {
   try {
@@ -1219,6 +1252,8 @@ export default function App() {
   const [flashEnabled, setFlashEnabled] = useState(() => loadBoolPref(FLASH_PREF_KEY, true));
   const [doubleTapEnabled, setDoubleTapEnabled] = useState(() => loadBoolPref(DOUBLE_TAP_PREF_KEY, false));
   const lastTapRef = useRef(null);
+  const [tapPreview, setTapPreview] = useState(null);
+  const tapPreviewTimerRef = useRef(null);
   const [shuffleAnim, setShuffleAnim] = useState(false);
   const prevStatusRef = useRef(undefined);
   const shuffleActiveRef = useRef(false);
@@ -1431,7 +1466,10 @@ export default function App() {
   }, [screen, code]);
 
   useEffect(() => {
-    if (room && room.status === "playing") setSelectedCard(null);
+    if (room && room.status === "playing") {
+      setSelectedCard(null);
+      setTapPreview(null);
+    }
   }, [room?.currentTurnId, room?.status]);
 
   useEffect(() => {
@@ -1452,39 +1490,39 @@ export default function App() {
 
   // Trick-winner pause: once a trick is marked complete (awaitingTrickClear),
   // wait briefly so everyone can see the winning card highlighted, then
-  // advance the game. Any client can perform this — the computation is
-  // deterministic from the frozen room state, so a duplicate write from
-  // two clients racing is harmless (same result, last write wins).
+  // advance the game. Every connected client schedules this, so the write
+  // goes through a transaction that re-checks awaitingTrickClear against
+  // live server state — whoever gets there first resolves it, and everyone
+  // else aborts instead of overwriting with a stale snapshot.
   useEffect(() => {
     if (!room || !room.awaitingTrickClear || !code) return;
-    const t = setTimeout(async () => {
-      let r = JSON.parse(JSON.stringify(room));
-      r = resolveTrickAfterPause(r);
-      await saveRoom(code, r);
-      setRoom(r);
+    const t = setTimeout(() => {
+      mutateRoom(code, (r) => {
+        if (!r.awaitingTrickClear) return undefined; // already resolved
+        return resolveTrickAfterPause(r);
+      });
     }, 1400);
     return () => clearTimeout(t);
   }, [room?.awaitingTrickClear, code]);
 
-  // Bot auto-play: when it's a bot's turn, any connected client computes
-  // its move and submits it after a short pacing delay (so it doesn't feel
-  // instant/robotic). Multiple clients may all detect the same bot turn and
-  // schedule this independently — that's fine. chooseBotCard is a pure
-  // function of the frozen room state, so they'd all compute the identical
-  // card; and as soon as the first write lands, every other client's copy
-  // of room.currentTurnId changes, which cancels their pending timers via
-  // the effect cleanup before a duplicate write can happen in practice.
+  // Bot auto-play: when it's a bot's turn, a connected client submits its
+  // move after a short pacing delay (so it doesn't feel instant/robotic).
+  // Like the resolver above this runs on every client, so the move is both
+  // chosen and applied inside a transaction against live state — a client
+  // whose snapshot is behind can't replay a move or rewind the trick.
   useEffect(() => {
     if (!room || room.status !== "playing" || room.awaitingTrickClear || !code) return;
     const currentPlayer = room.players.find((p) => p.id === room.currentTurnId);
     if (!currentPlayer || !currentPlayer.isBot) return;
-    const t = setTimeout(async () => {
-      let r = JSON.parse(JSON.stringify(room));
-      const card = chooseBotCard(r, room.currentTurnId);
-      if (!card) return;
-      r = playCard(r, room.currentTurnId, card);
-      await saveRoom(code, r);
-      setRoom(r);
+    const botId = room.currentTurnId;
+    const t = setTimeout(() => {
+      mutateRoom(code, (r) => {
+        if (r.status !== "playing" || r.awaitingTrickClear) return undefined;
+        if (r.currentTurnId !== botId) return undefined; // someone already moved
+        const card = chooseBotCard(r, botId);
+        if (!card) return undefined;
+        return playCard(r, botId, card);
+      });
     }, 850);
     return () => clearTimeout(t);
   }, [room?.currentTurnId, room?.status, room?.awaitingTrickClear, code]);
@@ -1572,30 +1610,34 @@ export default function App() {
   }
 
   async function addBot() {
-    if (!room || room.players.length >= room.maxPlayers) return;
-    let r = JSON.parse(JSON.stringify(room));
-    const botNum = (r.botCounter || 0) + 1;
-    r.botCounter = botNum;
-    const botId = `bot_${botNum}_${Math.random().toString(36).slice(2, 6)}`;
-    const botName = `Bot ${botNum}`;
-    r.players.push({ id: botId, name: botName, isBot: true });
-    r.turnOrder.push(botId);
-    r.scores[botId] = {};
-    pushLog(r, `${botName} added to the table.`);
-    await saveRoom(code, r);
-    setRoom(r);
+    if (!room || !code || room.players.length >= room.maxPlayers) return;
+    await mutateRoom(code, (r) => {
+      if (r.status !== "lobby") return undefined;
+      if (r.players.length >= r.maxPlayers) return undefined; // seat taken
+      const botNum = (r.botCounter || 0) + 1;
+      r.botCounter = botNum;
+      const botId = `bot_${botNum}_${Math.random().toString(36).slice(2, 6)}`;
+      const botName = `Bot ${botNum}`;
+      r.players.push({ id: botId, name: botName, isBot: true });
+      r.turnOrder.push(botId);
+      r.scores[botId] = {};
+      pushLog(r, `${botName} added to the table.`);
+      return r;
+    });
   }
 
   async function removeBot(pid) {
-    if (!room) return;
-    let r = JSON.parse(JSON.stringify(room));
-    const bot = r.players.find((p) => p.id === pid);
-    r.players = r.players.filter((p) => p.id !== pid);
-    r.turnOrder = r.turnOrder.filter((id) => id !== pid);
-    delete r.scores[pid];
-    if (bot) pushLog(r, `${bot.name} removed from the table.`);
-    await saveRoom(code, r);
-    setRoom(r);
+    if (!room || !code) return;
+    await mutateRoom(code, (r) => {
+      if (r.status !== "lobby") return undefined;
+      const bot = r.players.find((p) => p.id === pid);
+      if (!bot) return undefined; // already removed
+      r.players = r.players.filter((p) => p.id !== pid);
+      r.turnOrder = r.turnOrder.filter((id) => id !== pid);
+      delete r.scores[pid];
+      pushLog(r, `${bot.name} removed from the table.`);
+      return r;
+    });
   }
 
   async function joinRoom() {
@@ -1607,43 +1649,65 @@ export default function App() {
     if (!r) return setError("No table found with that code.");
     const pid = sanitizeId(name);
     if (!pid) return setError("Enter a valid name.");
+    let joined = r;
     if (!r.players.some((p) => p.id === pid)) {
       if (r.players.length >= r.maxPlayers) return setError(`Table is full (${r.maxPlayers} players).`);
       if (r.status !== "lobby") return setError("That round is already underway.");
-      r.players.push({ id: pid, name: pid });
-      r.turnOrder.push(pid);
-      r.scores[pid] = {};
-      pushLog(r, `${pid} joined the table.`);
-      await saveRoom(c, r);
+      // Claim the seat atomically — two people joining at the same instant
+      // would otherwise each write a player list missing the other.
+      let failure = null;
+      const result = await mutateRoom(c, (live) => {
+        if (live.players.some((p) => p.id === pid)) return undefined; // already in
+        if (live.status !== "lobby") {
+          failure = "That round is already underway.";
+          return undefined;
+        }
+        if (live.players.length >= live.maxPlayers) {
+          failure = `Table is full (${live.maxPlayers} players).`;
+          return undefined;
+        }
+        live.players.push({ id: pid, name: pid });
+        live.turnOrder.push(pid);
+        live.scores[pid] = {};
+        pushLog(live, `${pid} joined the table.`);
+        return live;
+      });
+      if (failure) return setError(failure);
+      if (result) joined = result;
     }
+    const r2 = joined;
     setCode(c);
     setMyId(pid);
-    setRoom(r);
+    setRoom(r2);
     // Joining mid-round: treat whatever kitty state already exists as the
     // baseline so we don't flash an award that happened before we connected.
-    seenKittyId.current = r.kittyReveal ? r.kittyReveal.id : null;
+    seenKittyId.current = r2.kittyReveal ? r2.kittyReveal.id : null;
     saveSession(c, name.trim());
-    setScreen(r.status === "lobby" ? "lobby" : "game");
+    setScreen(r2.status === "lobby" ? "lobby" : "game");
     setError("");
   }
 
   async function startGame() {
-    if (!room || room.players.length !== room.maxPlayers) return;
-    let r = { ...room, scores: { ...room.scores } };
-    r = startRound(r, 1);
-    await saveRoom(code, r);
-    setRoom(r);
+    if (!room || !code || room.players.length !== room.maxPlayers) return;
+    await mutateRoom(code, (r) => {
+      // Guard against two people tapping Deal at the same moment, which
+      // would otherwise deal the round twice and reshuffle mid-deal.
+      if (r.status !== "lobby") return undefined;
+      if (r.players.length !== r.maxPlayers) return undefined;
+      return startRound(r, 1);
+    });
     setScreen("game");
   }
 
   async function handlePlay(card) {
-    if (!room) return;
+    if (!room || !code) return;
     if (room.currentTurnId !== myId) return;
-    let r = JSON.parse(JSON.stringify(room));
-    r = playCard(r, myId, card);
-    await saveRoom(code, r);
-    setRoom(r);
     setSelectedCard(null);
+    await mutateRoom(code, (r) => {
+      if (r.status !== "playing" || r.awaitingTrickClear) return undefined;
+      if (r.currentTurnId !== myId) return undefined; // turn moved on — abort
+      return playCard(r, myId, card);
+    });
   }
 
   // Handles a tap on a card in hand.
@@ -1656,11 +1720,18 @@ export default function App() {
     if (doubleTapEnabled) {
       const last = lastTapRef.current;
       const now = Date.now();
-      if (last && last.id === id && now - last.time < 350) {
+      clearTimeout(tapPreviewTimerRef.current);
+      if (last && last.id === id && now - last.time < DOUBLE_TAP_MS) {
         lastTapRef.current = null;
+        setTapPreview(null);
         handlePlay(c);
       } else {
         lastTapRef.current = { id, time: now };
+        // Highlight the card so the first tap visibly registers, then drop
+        // it when the window closes — no silent taps, and the glow shows
+        // how long is left to complete the double tap.
+        setTapPreview(id);
+        tapPreviewTimerRef.current = setTimeout(() => setTapPreview(null), DOUBLE_TAP_MS);
       }
       return;
     }
@@ -1668,26 +1739,29 @@ export default function App() {
   }
 
   async function continueToNextRound() {
-    if (!room) return;
-    let r = JSON.parse(JSON.stringify(room));
-    r = startRound(r, room.round + 1);
-    await saveRoom(code, r);
-    setRoom(r);
+    if (!room || !code) return;
+    const expectedRound = room.round;
+    await mutateRoom(code, (r) => {
+      // If someone else already advanced the round, don't deal it twice.
+      if (r.round !== expectedRound) return undefined;
+      if (r.status !== "round-end") return undefined;
+      return startRound(r, expectedRound + 1);
+    });
   }
 
   // Manual score correction — for when the automated scoring gets
   // something wrong and needs a human fix. Logged for transparency so
   // everyone can see a correction happened.
   async function editScore(pid, round, newValue) {
-    if (!room) return;
-    let r = JSON.parse(JSON.stringify(room));
-    r.scores[pid] = r.scores[pid] || {};
-    const editorName = r.players.find((p) => p.id === myId)?.name || myId;
-    const targetName = r.players.find((p) => p.id === pid)?.name || pid;
-    pushLog(r, `${editorName} corrected ${targetName}'s Round ${round} score to ${newValue}.`);
-    r.scores[pid][round] = newValue;
-    await saveRoom(code, r);
-    setRoom(r);
+    if (!room || !code) return;
+    await mutateRoom(code, (r) => {
+      r.scores[pid] = r.scores[pid] || {};
+      const editorName = r.players.find((p) => p.id === myId)?.name || myId;
+      const targetName = r.players.find((p) => p.id === pid)?.name || pid;
+      pushLog(r, `${editorName} corrected ${targetName}'s Round ${round} score to ${newValue}.`);
+      r.scores[pid][round] = newValue;
+      return r;
+    });
   }
 
   // Returns just this device to the main menu. The table itself keeps
@@ -2278,6 +2352,7 @@ export default function App() {
           {myHand.map((c, i) => {
             const legal = isMyTurn && canPlayCard(myHand, c, room.leadSuit, forcedCardForHand);
             const isSelected = selectedCard && selectedCard.rank === c.rank && selectedCard.suit === c.suit;
+            const isTapPreview = doubleTapEnabled && tapPreview === cardId(c);
             const newSuitGroup = i > 0 && myHand[i - 1].suit !== c.suit;
             return (
               <div key={cardId(c)} style={{ marginLeft: newSuitGroup ? 10 : 0 }}>
@@ -2285,7 +2360,7 @@ export default function App() {
                   card={c}
                   size="md"
                   dim={isMyTurn && !legal}
-                  selected={isSelected}
+                  selected={isSelected || isTapPreview}
                   onClick={
                     legal
                       ? () => handleCardTap(c)
@@ -2429,7 +2504,7 @@ function GameMenu({
           <Toggle checked={doubleTapEnabled} onChange={onToggleDoubleTap} label="Double-Tap to Play" />
           {doubleTapEnabled && (
             <div style={{ fontSize: 11, color: T.ink, opacity: 0.55, padding: "0 2px 10px" }}>
-              A single tap won't select a card — double-tap it to play instantly.
+              First tap highlights the card, second tap plays it.
             </div>
           )}
         </div>
