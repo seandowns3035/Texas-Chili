@@ -804,15 +804,34 @@ function RoundInfoOverlay({ round, onClose }) {
 
 function ShuffleOverlay() {
   const cardBack = {
-    width: 58,
-    height: 82,
-    borderRadius: 8,
+    width: 42,
+    height: 60,
+    borderRadius: 6,
     background: `repeating-linear-gradient(45deg, ${T.feltDark}, ${T.feltDark} 4px, ${T.brassDim} 4px, ${T.brassDim} 5px)`,
-    border: `1.5px solid ${T.brassDim}`,
-    boxShadow: "0 4px 10px rgba(0,0,0,0.5)",
+    border: `1.2px solid ${T.brassDim}`,
+    boxShadow: "0 3px 8px rgba(0,0,0,0.5)",
     position: "absolute",
     inset: 0,
   };
+  // Four upward-angled streams — a stylized deal rather than tracking every
+  // actual player position, which stays reliable at any table size (3-10).
+  const directions = [
+    { dx: -150, dy: -240, rot: -22 },
+    { dx: -55, dy: -280, rot: -8 },
+    { dx: 55, dy: -280, rot: 8 },
+    { dx: 150, dy: -240, rot: 22 },
+  ];
+  const [pieces] = useState(() =>
+    directions.flatMap((dir, dIdx) =>
+      Array.from({ length: 3 }).map((_, i) => ({
+        id: `${dIdx}-${i}`,
+        dx: dir.dx + (Math.random() * 14 - 7),
+        dy: dir.dy + (Math.random() * 14 - 7),
+        rot: dir.rot + (Math.random() * 10 - 5),
+        delay: dIdx * 0.07 + i * 0.09,
+      }))
+    )
+  );
   return (
     <div
       style={{
@@ -826,22 +845,29 @@ function ShuffleOverlay() {
         pointerEvents: "none",
       }}
     >
-      <div style={{ position: "relative", width: 58, height: 82 }}>
-        {[0, 1, 2, 3, 4].map((i) => (
-          <div key={i} style={{ ...cardBack, animation: `shuffleCard 1.1s ease-in-out ${i * 0.06}s both` }} />
+      <div style={{ position: "relative", width: 42, height: 60 }}>
+        <div style={cardBack} />
+        {pieces.map((p) => (
+          <div
+            key={p.id}
+            style={{
+              ...cardBack,
+              "--dx": `${p.dx}px`,
+              "--dy": `${p.dy}px`,
+              "--rot": `${p.rot}deg`,
+              animation: `dealCard 0.85s cubic-bezier(0.16,0.8,0.3,1) ${p.delay}s both`,
+            }}
+          />
         ))}
       </div>
-      <div style={{ fontFamily: DISPLAY_FONT, fontSize: 12, color: T.brassLight, opacity: 0.8, marginTop: 16, letterSpacing: 1 }}>
-        Shuffling…
+      <div style={{ fontFamily: DISPLAY_FONT, fontSize: 12, color: T.brassLight, opacity: 0.8, marginTop: 18, letterSpacing: 1 }}>
+        Dealing…
       </div>
       <style>{`
-        @keyframes shuffleCard {
-          0% { transform: translateX(0) rotate(0deg); opacity: 0; }
-          15% { opacity: 1; }
-          35% { transform: translateX(-26px) rotate(-14deg); }
-          65% { transform: translateX(26px) rotate(14deg); }
-          85% { opacity: 1; }
-          100% { transform: translateX(0) rotate(0deg); opacity: 0; }
+        @keyframes dealCard {
+          0% { transform: translate(0, 0) rotate(0deg); opacity: 0; }
+          10% { opacity: 1; }
+          100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)); opacity: 0; }
         }
       `}</style>
     </div>
@@ -1210,6 +1236,40 @@ export default function App() {
       /* ignore */
     }
   }
+  // A riffle-shuffle sound built from short filtered noise bursts — no
+  // audio file needed, just generated white noise shaped into quick clicks.
+  function playShuffleSound() {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const duration = 0.85;
+      const bufferSize = Math.floor(ctx.sampleRate * duration);
+      const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      const burstCount = 9;
+      for (let b = 0; b < burstCount; b++) {
+        const start = Math.floor((b / burstCount) * bufferSize * 0.9);
+        const len = Math.floor(ctx.sampleRate * 0.035);
+        for (let i = 0; i < len && start + i < bufferSize; i++) {
+          const envelope = 1 - i / len;
+          data[start + i] = (Math.random() * 2 - 1) * envelope * 0.5;
+        }
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      const filter = ctx.createBiquadFilter();
+      filter.type = "highpass";
+      filter.frequency.value = 1200;
+      const gain = ctx.createGain();
+      gain.gain.value = 0.3;
+      source.connect(filter);
+      filter.connect(gain);
+      gain.connect(ctx.destination);
+      source.start();
+    } catch (e) {
+      /* ignore */
+    }
+  }
 
   // On load, try to silently rejoin whatever table this device was last
   // at — covers a dropped connection, a closed tab, or a phone restart,
@@ -1332,10 +1392,11 @@ export default function App() {
     if (prevStatus === undefined) return;
     if (prevStatus !== "playing" && room.status === "playing") {
       setShuffleAnim(true);
+      if (chimeEnabled) playShuffleSound();
       const t = setTimeout(() => setShuffleAnim(false), 1300);
       return () => clearTimeout(t);
     }
-  }, [room?.status]);
+  }, [room?.status, chimeEnabled]);
 
   // Turn alert: a brief flash + chime the moment a new turn actually starts
   // (not every render while it's still the same person's turn). Fires when
